@@ -39,9 +39,11 @@ from server_utils import (
     build_store_entry_map,
     build_update_candidate_record,
     encode_texts,
+    ensure_write_operations_allowed,
     get_embedder,
     is_field_record_entry,
     list_public_entries,
+    load_rebuild_state,
     load_store,
     normalize_record_ids,
     now_iso,
@@ -109,6 +111,7 @@ def delete_records_by_ids(
     embedder: Any | None = None,
     model_path: str | None = None,
 ) -> dict[str, Any]:
+    ensure_write_operations_allowed()
     normalized_ids = normalize_record_ids(record_ids)
     loaded_store = load_store()
     store_entries = list(loaded_store.get("entries") or [])
@@ -139,19 +142,24 @@ def delete_records_by_ids(
         for entry in store_entries
         if str(entry.get("id") or "").strip() not in deleted_id_set
     ]
-    update_store_and_rebuild(
+    rebuild_result = update_store_and_rebuild(
         remaining_entries,
         embedder=embedder,
         model_path=model_path,
         deleted_ids=deleted_ids,
     )
-
-    return {
+    result = {
         "ids": normalized_ids,
         "deleted_ids": deleted_ids,
         "missing_ids": missing_ids,
         "deleted_count": len(deleted_ids),
     }
+    if "index_refresh_state" in rebuild_result:
+        result["index_refresh_state"] = rebuild_result["index_refresh_state"]
+        result["index_refresh_mode"] = rebuild_result["index_refresh_mode"]
+        result["search_available"] = rebuild_result["search_available"]
+        result["message"] = rebuild_result["message"]
+    return result
 
 
 # 查询向量索引，并回源主 JSON 返回轻量候选结果；保留在本文件是为了让“查询输入 -> 向量检索 -> 主数据回源”的主流程保持可读。
@@ -290,6 +298,7 @@ def save_record(
     embedder: Any | None = None,
     model_path: str | None = None,
 ) -> dict[str, Any]:
+    ensure_write_operations_allowed()
     payload = build_payload(
         memory_kind=memory_kind,
         title=title,
@@ -375,6 +384,11 @@ def save_record(
         "timeline_summary": rebuild_result["timeline_summary"],
         "index_stats": rebuild_result["index_stats"],
     }
+    if "index_refresh_state" in rebuild_result:
+        result["index_refresh_state"] = rebuild_result["index_refresh_state"]
+        result["index_refresh_mode"] = rebuild_result["index_refresh_mode"]
+        result["search_available"] = rebuild_result["search_available"]
+        result["message"] = rebuild_result["message"]
     # 第九块：非 fact 记忆真实写入成功后，附带一个结构化的 fact 提取提醒。
     # 这里不代表服务端已自动提取 fact，而是把后续推荐流程显式返回给调用方。
     if str(normalized_saved_entry.get("memory_kind") or "").strip() != "fact":
@@ -390,6 +404,7 @@ def update_record(
     embedder: Any | None = None,
     model_path: str | None = None,
 ) -> dict[str, Any]:
+    ensure_write_operations_allowed()
     # 第一块：先规范化目标 id，尽早挡住空 id，避免后面把“没传主键”和“记录不存在”混成一类错误。
     normalized_record_id = str(record_id or "").strip()
     if not normalized_record_id:
@@ -498,6 +513,11 @@ def update_record(
         "timeline_summary": rebuild_result["timeline_summary"],
         "index_stats": rebuild_result["index_stats"],
     }
+    if "index_refresh_state" in rebuild_result:
+        result["index_refresh_state"] = rebuild_result["index_refresh_state"]
+        result["index_refresh_mode"] = rebuild_result["index_refresh_mode"]
+        result["search_available"] = rebuild_result["search_available"]
+        result["message"] = rebuild_result["message"]
     # 第九块：非 fact 记忆真实更新成功后，附带一个结构化的 fact 提取提醒。
     # 需不需要继续提取 fact 由调用方判断，服务端本轮只返回建议，不做自动语义提取。
     if str(normalized_updated_entry.get("memory_kind") or "").strip() != "fact":
@@ -514,7 +534,8 @@ def update_record(
         "推荐流程：1. 如果本次要存的是非事件记忆，先 search 看看是否已有与当前主题相近的记忆。"
         "2. 如果已存在相近记忆，优先判断是否应该对已有记忆执行 update。"
         "3. 如果不存在合适的已有记忆，再调用 save 新建一条记忆。"
-        "4. 每次 save 或 update 之后，再判断这条记忆里是否包含长期可复用、跨会话稳定、对长期陪伴有帮助的事实；如果有，则再按 fact 流程处理：先 search 相近 fact，若已有语义相近 fact 则优先 update，若没有相近 fact 则再 save 新 fact。"
+        "4. 每次 save 或 update 之后，再判断这条记忆里是否真的包含长期可复用、跨会话稳定、对长期陪伴有帮助的事实；只有确实存在这类事实时，才考虑继续按 fact 流程处理：先 search 相近 fact，若已有语义相近 fact 则优先 update，若没有相近 fact 则再 save 新 fact。"
+        "如果内容主要是项目问题的排查、调试和解决过程，而 project_record 已经完整记录，则通常不需要再额外提取 fact。"
         "这里说的是推荐使用策略，不是服务端自动执行逻辑。"
     ),
 )
@@ -525,7 +546,8 @@ def save(
             description=(
                 "必填。记忆类型，只能是 project_record、chat_event 或 fact。"
                 "chat_event 一般没有特殊说明时就作为一般事件类型存储。"
-                "fact 表示稳定事实记忆，更适合保存长期偏好、稳定约束、长期状态、已确认关系共识这类跨会话可复用事实。"
+                "fact 表示稳定事实记忆，以个人长期事实为主，更适合保存个人信息、长期偏好、稳定约束、长期状态、最近目标、已确认关系共识这类跨会话可复用事实。"
+                "不建议把 project_record 里已经完整记录的项目 debug 过程、排错流水和解决链路再重复存成 fact；只有当项目内容被提炼成真正稳定、可跨会话复用的规则时，才考虑转成 fact。"
             )
         ),
     ],
@@ -555,28 +577,28 @@ def save(
         str | None,
         Field(
             default=None,
-            description="project_record 必填，其他类型可选。用于保存问题及其背景、故障现象，或为什么要记录这条记忆。",
+            description="project_record 必填，其他类型可选。用于保存问题及其背景、故障现象，以及这条已解决问题为什么值得记录；不要写成流水账。",
         ),
     ] = None,
     analysis: Annotated[
         str | None,
         Field(
             default=None,
-            description="project_record 必填，其他类型可选。用于保存原因判断、方案分析、排查结论，以及为什么这么做。",
+            description="project_record 必填，其他类型可选。用于保存原因判断、方案分析、排查结论，以及为什么这样判断、为什么这么做；要留下后续可复用的思路。",
         ),
     ] = None,
     action_steps: Annotated[
         str | None,
         Field(
             default=None,
-            description="project_record 必填，其他类型可选。用于保存实际执行的步骤、命令、操作顺序或具体处理动作。",
+            description="project_record 必填，其他类型可选。用于保存真正解决问题时执行的关键步骤、命令、操作顺序或具体处理动作，不要堆无用流水过程。",
         ),
     ] = None,
     validation_result: Annotated[
         str | None,
         Field(
             default=None,
-            description="project_record 必填，其他类型可选。用于保存测试、验证、复现是否消失、验收结果等验证结论。",
+            description="project_record 必填，其他类型可选。用于保存测试、验证、复现是否消失、验收结果等验证结论；默认应记录已经解决并验证过的问题。",
         ),
     ] = None,
     tags: Annotated[
@@ -673,8 +695,29 @@ def search(
         ),
     ] = 5,
 ) -> dict[str, Any]:
-    results = search_records(query=query, top_k=top_k)
+    rebuild_state = load_rebuild_state()
     resolved_top_k = 5 if top_k is None else max(1, min(int(top_k), MAX_TOP_K))
+    rebuild_state_name = str(rebuild_state.get("state") or "").strip()
+    if rebuild_state_name == "running":
+        return {
+            "query": query,
+            "top_k": resolved_top_k,
+            "results": [],
+            "search_available": False,
+            "rebuild_state": "running",
+            "message": "索引正在后台重建，请稍后重试 search。",
+        }
+    if rebuild_state_name == "failed":
+        return {
+            "query": query,
+            "top_k": resolved_top_k,
+            "results": [],
+            "search_available": False,
+            "rebuild_state": "failed",
+            "message": "索引重建上一次失败了；先触发一次新的写入，让系统重新重建索引，再继续 search。",
+            "last_error": str(rebuild_state.get("last_error") or ""),
+        }
+    results = search_records(query=query, top_k=top_k)
     return {
         "query": query,
         "top_k": resolved_top_k,

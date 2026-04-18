@@ -14,6 +14,7 @@ import os
 import re
 import sys
 import time
+import threading
 from datetime import datetime
 from functools import lru_cache
 from pathlib import Path
@@ -205,6 +206,7 @@ TIMELINE_PATH = PROJECT_CONFIG["timeline_path"]  # 人类可读的时间线文�
 EMBEDDINGS_PATH = PROJECT_CONFIG["embeddings_path"]  # 已计算向量的本地缓存矩阵文件。
 INDEX_PATH = PROJECT_CONFIG["index_path"]  # FAISS 向量索引文件。
 META_PATH = PROJECT_CONFIG["meta_path"]  # 向量行号到记录 id 的映射文件。
+REBUILD_STATE_PATH = DATA_DIR / "rebuild_state.json"  # 后台全量重建状态文件。
 EMBED_MODEL_PATH = PROJECT_CONFIG["embed_model_path"]  # YAML 配置中的本地嵌入模型目录。
 EMBED_DEVICE = PROJECT_CONFIG["embed_device"]  # YAML 配置中的嵌入设备。
 
@@ -278,6 +280,9 @@ FACT_RETRIEVAL_FIELD_CANDIDATES = (
     "reference_doc_path",
 )  # fact 的检索文本优先保留稳定事实正文，不沿用项目经验的字段拼接偏好。
 MATCHED_FIELDS_LIMIT = 3  # search 返回的 matched_fields 最多保留 3 个，避免结果对象膨胀。
+BACKGROUND_REBUILD_MODE = "background_full_rebuild"  # 后台全量重建的固定模式名。
+_BACKGROUND_REBUILD_LOCK = threading.Lock()  # 同一进程内的后台重建串行锁。
+_BACKGROUND_REBUILD_THREAD: threading.Thread | None = None  # 当前进程里正在运行的后台重建线程引用。
 
 # 类型声明上这是 Literal[...]，也就是“只允许固定几个字符串字面量”的类型；运行时拿到的数据类型仍然是 str，例如 "fact"。
 # 对外 save / update 这类工具里的 memory_kind 只能传 "project_record"、"chat_event" 或 "fact"；最终进代码时就是这三个字符串之一，不是别的对象类型。
@@ -519,9 +524,9 @@ def build_fallback_tags(memory_kind: StoredMemoryKind, title: str, detailed_summ
 def build_fact_extraction_reminder() -> dict[str, Any]:
     return {
         "decision_by_caller": True,
-        "message": "这条非 fact 记忆写入成功后，是否要继续提取长期可复用 fact，由调用方判断。",
+        "message": "这条非 fact 记忆写入成功后，是否还值得继续提取长期可复用 fact，由调用方判断；优先关注个人长期事实，而不是把已经写清的项目排查和解决过程再重复沉淀成 fact。",
         "recommended_steps": [
-            "判断这条记忆中是否包含长期可复用、跨会话稳定、会持续影响回答的事实。",
+            "先判断这条记忆里是否真的包含长期可复用、跨会话稳定、会持续影响回答的事实；如果只是项目问题的完整排查与解决链路，且 project_record 已经写清，通常不需要再额外提取 fact。",
             "若包含，先 search 相近 fact。",
             "若存在语义相近 fact，优先 update。",
             "若不存在相近 fact，再 save 新 fact。",
@@ -1133,6 +1138,198 @@ def write_json_atomic(path: Path, data: dict[str, Any]) -> None:
     write_text_atomic(path, text + "\n")
 
 
+# 生成统一的索引重建状态对象；这个对象会写进 rebuild_state.json，供 save、update、delete 和 search 共用。
+def build_rebuild_state_snapshot(
+    state: str,
+    mode: str = "",
+    started_at: str = "",
+    finished_at: str = "",
+    last_error: str = "",
+    target_entry_count: int = 0,
+    worker_pid: int = 0,
+) -> dict[str, Any]:
+    return {
+        "state": str(state or "").strip() or "idle",
+        "mode": str(mode or "").strip(),
+        "started_at": str(started_at or "").strip(),
+        "finished_at": str(finished_at or "").strip(),
+        "last_error": str(last_error or "").strip(),
+        "store_version_seen": STORE_VERSION,
+        "target_entry_count": int(target_entry_count or 0),
+        "worker_pid": int(worker_pid or 0),
+    }
+
+
+# 以原子方式写 rebuild_state.json；前台请求和后台重建线程通过这份文件共享索引状态。
+def write_rebuild_state(snapshot: dict[str, Any]) -> None:
+    write_json_atomic(REBUILD_STATE_PATH, snapshot)
+
+
+# 读取 rebuild_state.json，并在检测到“旧进程残留的 running 状态”时自动纠正为 failed。
+# 这里直接用文件，而不是只靠进程内变量，是为了让后续请求能看到后台重建的最新状态。
+def load_rebuild_state() -> dict[str, Any]:
+    if not REBUILD_STATE_PATH.exists():
+        return build_rebuild_state_snapshot(state="idle", finished_at=now_iso())
+
+    try:
+        with REBUILD_STATE_PATH.open("r", encoding="utf-8") as handle:
+            raw_snapshot = json.load(handle)
+    except (OSError, json.JSONDecodeError) as exc:
+        failed_snapshot = build_rebuild_state_snapshot(
+            state="failed",
+            mode=BACKGROUND_REBUILD_MODE,
+            finished_at=now_iso(),
+            last_error=f"rebuild_state.json is unreadable: {exc}",
+            worker_pid=os.getpid(),
+        )
+        write_rebuild_state(failed_snapshot)
+        return failed_snapshot
+
+    if not isinstance(raw_snapshot, dict):
+        failed_snapshot = build_rebuild_state_snapshot(
+            state="failed",
+            mode=BACKGROUND_REBUILD_MODE,
+            finished_at=now_iso(),
+            last_error="rebuild_state.json must contain an object.",
+            worker_pid=os.getpid(),
+        )
+        write_rebuild_state(failed_snapshot)
+        return failed_snapshot
+
+    snapshot = build_rebuild_state_snapshot(
+        state=str(raw_snapshot.get("state") or "idle"),
+        mode=str(raw_snapshot.get("mode") or ""),
+        started_at=str(raw_snapshot.get("started_at") or ""),
+        finished_at=str(raw_snapshot.get("finished_at") or ""),
+        last_error=str(raw_snapshot.get("last_error") or ""),
+        target_entry_count=int(raw_snapshot.get("target_entry_count") or 0),
+        worker_pid=int(raw_snapshot.get("worker_pid") or 0),
+    )
+    if snapshot["state"] == "running" and int(snapshot.get("worker_pid") or 0) != os.getpid():
+        failed_snapshot = build_rebuild_state_snapshot(
+            state="failed",
+            mode=str(snapshot.get("mode") or BACKGROUND_REBUILD_MODE),
+            started_at=str(snapshot.get("started_at") or ""),
+            finished_at=now_iso(),
+            last_error="Previous process exited while background index rebuild was still running.",
+            target_entry_count=int(snapshot.get("target_entry_count") or 0),
+            worker_pid=os.getpid(),
+        )
+        write_rebuild_state(failed_snapshot)
+        return failed_snapshot
+    return snapshot
+
+
+# 在写入型工具入口统一拦住“后台全量重建仍在运行”的场景，避免新主数据和旧重建任务互相覆盖。
+def ensure_write_operations_allowed() -> None:
+    rebuild_state = load_rebuild_state()
+    if str(rebuild_state.get("state") or "").strip() == "running":
+        raise RuntimeError("Index rebuild is still running. Save, update, and delete are temporarily unavailable; retry later.")
+
+
+# 读取当前 meta 里已落盘的索引统计；后台重建尚未完成时，上层返回会用它说明旧索引还停留在什么状态。
+def load_current_index_stats() -> dict[str, int]:
+    current_stats = {"count": 0, "dim": 0}
+    if not META_PATH.exists():
+        return current_stats
+    try:
+        with META_PATH.open("r", encoding="utf-8") as handle:
+            current_meta = json.load(handle)
+    except (OSError, json.JSONDecodeError):
+        return current_stats
+    if not isinstance(current_meta, dict):
+        return current_stats
+    row_to_id = current_meta.get("row_to_id") or []
+    if isinstance(row_to_id, list):
+        current_stats["count"] = len(row_to_id)
+    current_stats["dim"] = int(current_meta.get("dim") or 0)
+    return current_stats
+
+
+# 为 save/update 的异步慢路径生成统一的返回片段；它明确告诉调用方主数据已写入，但 search 需要等后台重建完成。
+def build_background_rebuild_notice() -> dict[str, Any]:
+    return {
+        "index_refresh_state": "rebuilding",
+        "index_refresh_mode": BACKGROUND_REBUILD_MODE,
+        "search_available": False,
+        "message": "主数据已写入，向量索引正在后台重建；重建完成前 search 不可用。",
+    }
+
+
+# 在当前 MCP 进程里后台执行一次完整索引重建；它只读最新 memory.json，并把索引侧文件补齐到一致状态。
+def run_background_full_rebuild(started_at: str, model_path: str, target_entry_count: int) -> None:
+    try:
+        loaded_store = load_store()
+        entries = list(loaded_store.get("entries") or [])
+        rebuild_stats = rebuild_vector_index(entries, model_path=model_path)
+        write_rebuild_state(
+            build_rebuild_state_snapshot(
+                state="idle",
+                mode=BACKGROUND_REBUILD_MODE,
+                started_at=started_at,
+                finished_at=now_iso(),
+                target_entry_count=int(rebuild_stats.get("count") or target_entry_count),
+                worker_pid=os.getpid(),
+            )
+        )
+    except Exception as exc:
+        write_rebuild_state(
+            build_rebuild_state_snapshot(
+                state="failed",
+                mode=BACKGROUND_REBUILD_MODE,
+                started_at=started_at,
+                finished_at=now_iso(),
+                last_error=f"{type(exc).__name__}: {exc}",
+                target_entry_count=target_entry_count,
+                worker_pid=os.getpid(),
+            )
+        )
+
+
+# 启动后台全量重建线程，并立刻返回给前台请求一个“主数据已写入、索引仍在补齐”的结构化提醒。
+def launch_background_full_rebuild(model_path: str, target_entry_count: int) -> dict[str, Any]:
+    global _BACKGROUND_REBUILD_THREAD
+
+    with _BACKGROUND_REBUILD_LOCK:
+        current_state = load_rebuild_state()
+        if str(current_state.get("state") or "").strip() == "running":
+            raise RuntimeError("Index rebuild is already running. Retry after it finishes.")
+
+        started_at = now_iso()
+        running_snapshot = build_rebuild_state_snapshot(
+            state="running",
+            mode=BACKGROUND_REBUILD_MODE,
+            started_at=started_at,
+            target_entry_count=target_entry_count,
+            worker_pid=os.getpid(),
+        )
+        write_rebuild_state(running_snapshot)
+
+        worker = threading.Thread(
+            target=run_background_full_rebuild,
+            args=(started_at, model_path, target_entry_count),
+            name="memory-rag-mcp-background-rebuild",
+            daemon=True,
+        )
+        try:
+            worker.start()
+        except Exception as exc:
+            failed_snapshot = build_rebuild_state_snapshot(
+                state="failed",
+                mode=BACKGROUND_REBUILD_MODE,
+                started_at=started_at,
+                finished_at=now_iso(),
+                last_error=f"Failed to start background rebuild thread: {exc}",
+                target_entry_count=target_entry_count,
+                worker_pid=os.getpid(),
+            )
+            write_rebuild_state(failed_snapshot)
+            raise RuntimeError("Failed to start background index rebuild.") from exc
+
+        _BACKGROUND_REBUILD_THREAD = worker
+    return build_background_rebuild_notice()
+
+
 # 以原子方式写本地 embedding 缓存矩阵，保证向量缓存不会在中途写坏。
 def write_embeddings_atomic(path: Path, embeddings: np.ndarray) -> None:
     ensure_memory_dir()
@@ -1436,6 +1633,7 @@ def update_store_and_rebuild(
     sorted_entries = sort_entries(synchronized_entries)
     public_sorted_entries = list_public_entries(sorted_entries)  # 对外统计和时间线只看主记忆，不把 field_record 算进去。
     store = {"version": STORE_VERSION, "entries": sorted_entries}
+    background_rebuild_notice: dict[str, Any] | None = None
 
     # 写盘：写入拼接并排序后的最新的 主数据.JSON 和 时间线.md，这样上的业务事实源都已经更新成最新状态
     write_json_atomic(STORE_PATH, store)
@@ -1447,6 +1645,14 @@ def update_store_and_rebuild(
     if not sorted_entries:  # 如果主数据列表为空，则清空embedding 缓存、FAISS 和 meta
         # 下面传入空 entries 和空矩阵，只是为了复用 rebuild_index_from_embeddings 里的清理逻辑，
         rebuild_stats = rebuild_index_from_embeddings([], np.empty((0, 0), dtype="float32"), resolved_model_path)
+        write_rebuild_state(
+            build_rebuild_state_snapshot(
+                state="idle",
+                finished_at=now_iso(),
+                target_entry_count=0,
+                worker_pid=os.getpid(),
+            )
+        )
     else:  
         # 非空，先 load_reusable_embedding_cache() 尝试读取现有可复用的 embedding 缓存
         # 该函数为双返回值，所以 cached_embedding_state 命中时，里面同时包含：
@@ -1517,12 +1723,12 @@ def update_store_and_rebuild(
                 )
             else:
                 # 只要新增快路径的前提不再安全，就回退到完整重建，
-                # 让系统重新基于当前主数据生成全部向量和索引，避免产生脏状态。
-                rebuild_stats = rebuild_vector_index(
-                    sorted_entries,
-                    embedder=embedder,
-                    model_path=resolved_model_path,
+                # 但这轮不再把全量 embedding 堵在前台请求里，而是改成后台慢任务继续补齐索引。
+                background_rebuild_notice = launch_background_full_rebuild(
+                    resolved_model_path,
+                    len(sorted_entries),
                 )
+                rebuild_stats = load_current_index_stats()
         # 删除链路的缓存复用路径：
         # 这里不会重新调用 embedding 模型。
         # 仅仅把旧缓存中的 id -> 向量映射留下来，再按“删除后的当前记录顺序”重拼矩阵，
@@ -1558,12 +1764,12 @@ def update_store_and_rebuild(
                 )
             else:
                 # 如果旧缓存和当前删除结果对不上，就退回全量重建，
-                # 让系统重新根据主数据生成一套干净的向量和索引。
-                rebuild_stats = rebuild_vector_index(
-                    sorted_entries,
-                    embedder=embedder,
-                    model_path=resolved_model_path,
+                # 但这轮不再把全量 embedding 堵在前台请求里，而是改成后台慢任务继续补齐索引。
+                background_rebuild_notice = launch_background_full_rebuild(
+                    resolved_model_path,
+                    len(sorted_entries),
                 )
+                rebuild_stats = load_current_index_stats()
         # update 的精确增量路径：
         # 这里不走“公共 delete + 公共 save”两步，而是直接在内存里替换旧主记忆家族，
         # 然后只重算这个主记忆本体及其当前 field_record 家族的向量。
@@ -1612,20 +1818,30 @@ def update_store_and_rebuild(
                 )
             else:
                 # 只要当前缓存无法证明“除了这次更新家族外，其余记录都还能直接复用旧向量”，
-                # 就退回全量重建，避免主记忆和 field_record 家族留下不一致状态。
-                rebuild_stats = rebuild_vector_index(
-                    sorted_entries,
-                    embedder=embedder,
-                    model_path=resolved_model_path,
+                # 就改成后台全量重建，避免把长时间 embedding 堵在当前工具调用里。
+                background_rebuild_notice = launch_background_full_rebuild(
+                    resolved_model_path,
+                    len(sorted_entries),
                 )
+                rebuild_stats = load_current_index_stats()
         else:
             # 这里是完整后门：
             # 首次建库、缓存不存在、缓存和当前模型/字段规则不一致、或新增/删除条件无法安全命中时，
-            # 都回退到“重新为全部记录生成 retrieval_text 并全量 embedding”的保守路线。
-            rebuild_stats = rebuild_vector_index(
-                sorted_entries,
-                embedder=embedder,
-                model_path=resolved_model_path,
+            # 都改成后台慢任务去做“重新为全部记录生成 retrieval_text 并全量 embedding”的保守路线。
+            background_rebuild_notice = launch_background_full_rebuild(
+                resolved_model_path,
+                len(sorted_entries),
+            )
+            rebuild_stats = load_current_index_stats()
+
+        if background_rebuild_notice is None:
+            write_rebuild_state(
+                build_rebuild_state_snapshot(
+                    state="idle",
+                    finished_at=now_iso(),
+                    target_entry_count=len(sorted_entries),
+                    worker_pid=os.getpid(),
+                )
             )
 
     # 最后返回给 save_record / delete_records_by_ids 一个简短摘要，
@@ -1635,9 +1851,12 @@ def update_store_and_rebuild(
         f"{entry['updated_at']} | {entry['title']}"
         for entry in public_sorted_entries[:3]
     ]
-    return {
+    result = {
         "normalized_entries": sorted_entries,
         "total_entries": len(public_sorted_entries),
         "timeline_summary": timeline_summary,
         "index_stats": rebuild_stats,
     }
+    if background_rebuild_notice is not None:
+        result.update(background_rebuild_notice)
+    return result
