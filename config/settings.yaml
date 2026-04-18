@@ -1,0 +1,94 @@
+# memory-rag-mcp 的运行配置。
+# 所有相对路径都以 AI-memory/memory-rag-mcp/ 为基准解析。
+# 这份文件由服务进程在启动时读取一次。
+# 当前运行中的 memory-rag-mcp 不会自动监听或热更新这里的配置。
+# 修改任意配置后，都需要重启 MCP 进程，新的配置才会生效。
+
+# MCP 服务自身的识别信息。
+server:
+  name: memory-rag-mcp # MCP 服务名，供服务端和客户端识别。
+
+# 项目运行时使用的目录和文件路径。
+paths:
+  ai_memory_dir: .. # 代码所在的根目录
+  data_dir: ../memory-rag-mcp-data # 本项目的数据目录。
+  store_path: ../memory-rag-mcp-data/memory.json # 主数据 JSON 文件路径。
+  timeline_path: ../memory-rag-mcp-data/RAG记忆库时间线.md # 时间线 Markdown 文件路径。
+  embeddings_path: ../memory-rag-mcp-data/memory_embeddings.npy # 本地 embedding 缓存矩阵文件路径。
+  index_path: ../memory-rag-mcp-data/memory.faiss # FAISS 向量索引文件路径。
+  meta_path: ../memory-rag-mcp-data/memory_meta.json # 向量索引元数据文件路径。
+
+# embedding 模型与推理设备配置。
+embedding:
+  model_path: ../models/bge-m3 # 本地 embedding 模型目录。
+  device: cpu # embedding 推理设备，例如 cpu 或 cuda。
+
+# 主数据结构和记忆类型相关配置。
+memory:
+  store_version: 8 # 主数据结构版本号。
+  kind_values: # 允许的记忆类型枚举值。
+    - project_record
+    - chat_event
+    - fact
+    - field_record
+
+# 摘要与标签生成相关配置。
+summary:
+  tag_fallback_limit: 6 # 服务端兜底标签的最大数量。
+  short_summary_max_length: 120 # 自动生成简短摘要时的最大字符数。
+
+# 搜索接口的基础限制。
+search:
+  max_top_k: 20 # 搜索接口允许返回的最大条数。
+
+# 检索文本拼接规则。
+retrieval:
+  field_candidates: # 默认参与检索文本拼接的字段顺序。
+    - title
+    - short_summary
+    - problem_background
+    - analysis
+    - action_steps
+    - validation_result
+    - tags
+    - reference_doc_path
+  field_labels: # 检索文本拼接时使用的人类可读标签名。
+    title: 标题
+    short_summary: 简短摘要
+    problem_background: 问题背景
+    analysis: 分析
+    action_steps: 步骤
+    validation_result: 验证结果
+    detailed_summary: 详细总结
+    tags: 标签
+    reference_doc_path: 参考文档
+
+# 对外结果字段裁剪规则。
+results:
+  search_fields: # search 默认返回的轻量字段。
+    - id
+    - memory_kind
+    - updated_at
+    - created_at
+    - title
+    - short_summary
+    - tags
+    - reference_doc_path
+  detail_fields: # 详情接口默认返回的完整业务字段。
+    - id
+    - updated_at
+    - created_at
+    - memory_kind
+    - title
+    - short_summary
+    - problem_background
+    - analysis
+    - action_steps
+    - validation_result
+    - detailed_summary
+    - tags
+    - source_paths
+    - reference_doc_path
+  debug_fields: # 仅在调试模式下返回的内部字段。
+    - fingerprint
+    - retrieval_fields

@@ -1,0 +1,8 @@
+本仓库不附带 embedding 模型权重文件。
+
+当前项目运行时实际使用的模型目录，由 config/settings.yaml 里的 embedding.model_path 参数决定。
+使用前请先自行下载所需模型，并把 embedding.model_path 改成你自己机器上的本地模型目录。
+
+推荐模型下载地址：
+- bge-m3: https://huggingface.co/BAAI/bge-m3
+- m3e-large: https://huggingface.co/moka-ai/m3e-large
