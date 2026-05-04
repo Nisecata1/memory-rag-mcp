@@ -1435,6 +1435,62 @@ def resolve_embed_device() -> str:
     return EMBED_DEVICE
 
 
+# 为当前模型目录生成稳定的内容指纹;
+# save/update 的缓存复用判断、search 的索引一致性校验和 meta 写盘都会用到它;
+def build_model_fingerprint(model_path: str) -> str:
+    normalized_model_path = str(model_path or "").strip()
+    if not normalized_model_path:
+        raise RuntimeError("Embedding model path must not be empty when building model_fingerprint.")
+
+    model_dir = Path(normalized_model_path)
+    if not model_dir.is_dir():
+        raise RuntimeError(f"Embedding model directory does not exist: {model_dir}")
+
+    small_hash_targets = (
+        "config.json",
+        "config_sentence_transformers.json",
+        "modules.json",
+        "sentence_bert_config.json",
+        "special_tokens_map.json",
+        "tokenizer_config.json",
+        "README.md",
+    )
+    large_hash_targets = (
+        "pytorch_model.bin",
+        "model.safetensors",
+        "sentencepiece.bpe.model",
+        "tokenizer.json",
+        "colbert_linear.pt",
+        "sparse_linear.pt",
+    )
+    sample_size = 64 * 1024
+    digest = hashlib.sha256()
+    digest.update(f"model_dir={model_dir.resolve()}".encode("utf-8"))
+
+    for relative_name in small_hash_targets:
+        target_path = model_dir / relative_name
+        if not target_path.is_file():
+            continue
+        digest.update(f"small:{relative_name}:".encode("utf-8"))
+        with target_path.open("rb") as handle:
+            digest.update(handle.read())
+
+    for relative_name in large_hash_targets:
+        target_path = model_dir / relative_name
+        if not target_path.is_file():
+            continue
+        target_size = target_path.stat().st_size
+        digest.update(f"large:{relative_name}:{target_size}:".encode("utf-8"))
+        with target_path.open("rb") as handle:
+            digest.update(handle.read(sample_size))
+            if target_size > sample_size:
+                tail_offset = max(target_size - sample_size, 0)
+                handle.seek(tail_offset)
+                digest.update(handle.read(sample_size))
+
+    return digest.hexdigest()
+
+
 # 缓存 sentence-transformers 模型实例，避免每次工具调用都重复加载。
 @lru_cache(maxsize=2)
 def get_embedder(model_path: str, device: str) -> Any:
@@ -1477,14 +1533,24 @@ def normalize_record_ids(record_ids: list[str] | None) -> list[str]:
     return normalized_ids
 
 
-# 这个函数就是根据传入的 entries 写进 meta 文件的
+# 这个函数就是根据传入的 entries 写进 meta 文件的。
 # entries 参数是上游已经排好序、并且与 embedding 矩阵行顺序一一对应的完整记录列表。
-# update_store_and_rebuild / rebuild_vector_index 会先确定当前整库记录顺
+# update_store_and_rebuild / rebuild_vector_index 会先确定当前整库记录顺序，
 # 再由 rebuild_index_from_embeddings 把这份顺序传进来。
-# 这个函数只负责把“当前索引第几行对应哪个记录 id，以及索引使用了哪个模型和维度”写进 meta 文件。
-def write_vector_meta(entries: list[dict[str, Any]], model_path: str, dim: int) -> None:
+# 这里的 model_path 只用于写入给人看的 meta["model"]，方便排查当前索引当时用了哪个模型目录，
+# 它不再参与机器判断；真正给程序比对模型身份的是 model_fingerprint。
+# dim 也不是配置常量，而是这次实际写盘的 embedding 矩阵列数，所以继续由上游按当前结果传进来。
+# retrieval_field_signature 则继续直接使用模块级常量 RETRIEVAL_FIELD_SIGNATURE，
+# 因为它来自启动时读取的 retrieval.field_candidates，表示当前代码这套检索字段拼接规则。
+def write_vector_meta(
+    entries: list[dict[str, Any]],
+    model_path: str,
+    model_fingerprint: str,
+    dim: int,
+) -> None:
     meta = {
         "model": model_path,
+        "model_fingerprint": model_fingerprint,
         "dim": int(dim),
         "normalized": True,
         "retrieval_field_signature": RETRIEVAL_FIELD_SIGNATURE,
@@ -1496,9 +1562,13 @@ def write_vector_meta(entries: list[dict[str, Any]], model_path: str, dim: int) 
     write_json_atomic(META_PATH, meta)
 
 
-# 校验并读取当前仍可复用的本地向量缓存和 meta 索引
-# 上层函数：update_store_and_rebuild 会在 save / delete 等快路径里优先走这里，判断旧缓存还能不能继续复用。
-def load_reusable_embedding_cache(model_path: str) -> tuple[np.ndarray, list[str]] | None:
+# 校验并读取（若校验通过）当前仍可复用的本地向量缓存和 meta 索引。
+# 上层函数 update_store_and_rebuild() 会在 save / delete 接口的快路径里优先走这里，来判断旧缓存还能不能继续复用。
+# 这里要求调用方传入“本次请求最终选中的模型目录”对应的 model_fingerprint，
+# 因为模型身份属于这次请求上下文，不应该在这个下层函数里再重复扫描模型目录生成一次。
+# retrieval_field_signature 继续直接读取模块级常量 RETRIEVAL_FIELD_SIGNATURE，
+# 因为它代表的是当前代码的字段拼接规则，不是每次请求单独生成的数据。
+def load_reusable_embedding_cache(model_fingerprint: str) -> tuple[np.ndarray, list[str]] | None:
     if not EMBEDDINGS_PATH.exists() or not META_PATH.exists():
         return None
 
@@ -1519,7 +1589,7 @@ def load_reusable_embedding_cache(model_path: str) -> tuple[np.ndarray, list[str
 
     if not isinstance(meta, dict):
         return None
-    if str(meta.get("model") or "") != model_path:
+    if str(meta.get("model_fingerprint") or "").strip() != str(model_fingerprint or "").strip():
         return None
     if str(meta.get("retrieval_field_signature") or "") != RETRIEVAL_FIELD_SIGNATURE:
         return None
@@ -1549,10 +1619,14 @@ def load_reusable_embedding_cache(model_path: str) -> tuple[np.ndarray, list[str
 
 
 # update_store_and_rebuild、rebuild_vector_index 和增量缓存路径都通过这里把向量缓存与索引产物同步写盘。
+# 这个函数只负责把“已经准备好的向量矩阵”和“已经确定好的模型身份信息”落成 .npy / .faiss / meta 三份产物。
+# 它不会再自己生成 model_fingerprint；dim 也直接从当前 embeddings 的列数计算，
+# 因为 dim 属于这次写盘结果，不适合提成服务级静态变量。
 def rebuild_index_from_embeddings(
     entries: list[dict[str, Any]],
     embeddings: np.ndarray,
     model_path: str,
+    model_fingerprint: str,
 ) -> dict[str, Any]:
     if not entries:
         for artifact_path in (EMBEDDINGS_PATH, INDEX_PATH, META_PATH):
@@ -1571,7 +1645,7 @@ def rebuild_index_from_embeddings(
     index = faiss.IndexFlatIP(dim)
     index.add(normalized_embeddings)
     faiss.write_index(index, str(INDEX_PATH))
-    write_vector_meta(entries, model_path, dim)
+    write_vector_meta(entries, model_path, model_fingerprint, dim)
     return {"count": len(entries), "dim": dim}
 
 
@@ -1583,14 +1657,25 @@ def rebuild_vector_index(
     model_path: str | None = None,
 ) -> dict[str, Any]:
     resolved_model_path = model_path or resolve_embed_model_path()
+    current_model_fingerprint = build_model_fingerprint(resolved_model_path)
     if not entries:
-        return rebuild_index_from_embeddings([], np.empty((0, 0), dtype="float32"), resolved_model_path)
+        return rebuild_index_from_embeddings(
+            [],
+            np.empty((0, 0), dtype="float32"),
+            resolved_model_path,
+            current_model_fingerprint,
+        )
 
     resolved_embedder = embedder or get_embedder(resolved_model_path, resolve_embed_device())
     sorted_entries = sort_entries(entries)
     retrieval_texts = [build_retrieval_text(entry) for entry in sorted_entries]
     embeddings = encode_texts(retrieval_texts, resolved_embedder)
-    return rebuild_index_from_embeddings(sorted_entries, embeddings, resolved_model_path)
+    return rebuild_index_from_embeddings(
+        sorted_entries,
+        embeddings,
+        resolved_model_path,
+        current_model_fingerprint,
+    )
 
 
 # 顶层函数是 save_record、update_record 和 delete_records_by_ids 
@@ -1640,11 +1725,17 @@ def update_store_and_rebuild(
     write_text_atomic(TIMELINE_PATH, build_timeline_markdown(sorted_entries))
     # 获取模型目录
     resolved_model_path = model_path or resolve_embed_model_path()
+    current_model_fingerprint = build_model_fingerprint(resolved_model_path)
 
     # 开始更新后续的 .npy / .faiss / meta 文件。
     if not sorted_entries:  # 如果主数据列表为空，则清空embedding 缓存、FAISS 和 meta
         # 下面传入空 entries 和空矩阵，只是为了复用 rebuild_index_from_embeddings 里的清理逻辑，
-        rebuild_stats = rebuild_index_from_embeddings([], np.empty((0, 0), dtype="float32"), resolved_model_path)
+        rebuild_stats = rebuild_index_from_embeddings(
+            [],
+            np.empty((0, 0), dtype="float32"),
+            resolved_model_path,
+            current_model_fingerprint,
+        )
         write_rebuild_state(
             build_rebuild_state_snapshot(
                 state="idle",
@@ -1659,7 +1750,7 @@ def update_store_and_rebuild(
         #   1. 已经算好的向量矩阵（numpy）
         #   2. 向量矩阵每一行对应的记录 id 顺序（row-to-id）
         # 后续 新增 / 删除 分支都会优先复用这份缓存。
-        cached_embedding_state = load_reusable_embedding_cache(resolved_model_path)
+        cached_embedding_state = load_reusable_embedding_cache(current_model_fingerprint)
 
         # save 的增量路径（当新增记录时执行的代码）：
         #   1. 只对新增记录生成 retrieval_text 并做一次 embedding
@@ -1720,6 +1811,7 @@ def update_store_and_rebuild(
                     sorted_entries,
                     rebuilt_embeddings,
                     resolved_model_path,
+                    current_model_fingerprint,
                 )
             else:
                 # 只要新增快路径的前提不再安全，就回退到完整重建，
@@ -1761,6 +1853,7 @@ def update_store_and_rebuild(
                     sorted_entries,
                     rebuilt_embeddings,
                     resolved_model_path,
+                    current_model_fingerprint,
                 )
             else:
                 # 如果旧缓存和当前删除结果对不上，就退回全量重建，
@@ -1815,6 +1908,7 @@ def update_store_and_rebuild(
                     sorted_entries,
                     rebuilt_embeddings,
                     resolved_model_path,
+                    current_model_fingerprint,
                 )
             else:
                 # 只要当前缓存无法证明“除了这次更新家族外，其余记录都还能直接复用旧向量”，

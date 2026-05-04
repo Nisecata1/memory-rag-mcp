@@ -35,6 +35,7 @@ from server_utils import (
     SourcePathListInput,
     TagListInput,
     build_fact_extraction_reminder,
+    build_model_fingerprint,
     build_payload,
     build_store_entry_map,
     build_update_candidate_record,
@@ -51,6 +52,7 @@ from server_utils import (
     payload_id,
     resolve_embed_device,
     resolve_embed_model_path,
+    RETRIEVAL_FIELD_SIGNATURE,
     sort_entries,
     update_store_and_rebuild,
     validate_update_changes,
@@ -197,6 +199,15 @@ def search_records(
         raise RuntimeError("Vector index file does not exist yet. Save at least one record first.")
     index = faiss.read_index(str(INDEX_PATH))
     resolved_model_path = model_path or resolve_embed_model_path()
+    current_model_fingerprint = build_model_fingerprint(resolved_model_path)
+    if str(meta.get("model_fingerprint") or "").strip() != current_model_fingerprint:
+        raise RuntimeError(
+            "Vector index was built with a different embedding model. Rebuild the index before searching."
+        )
+    if str(meta.get("retrieval_field_signature") or "") != RETRIEVAL_FIELD_SIGNATURE:
+        raise RuntimeError(
+            "Vector index retrieval field signature does not match current code. Rebuild the index before searching."
+        )
     resolved_embedder = embedder or get_embedder(resolved_model_path, resolve_embed_device())
     query_vector = encode_texts([normalized_query], resolved_embedder)
 
