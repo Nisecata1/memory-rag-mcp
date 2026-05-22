@@ -9,7 +9,7 @@
 - 传输方式：`stdio`
 
 ## 项目特点
-
+![memory-rag-mcp overview](assets/readme-overview.png)
 **SQLite 作为主数据来源接入**
 当前主数据事实源已经收口到 `SQLite`。这里具体指：`save / update / delete / get_details / timeline` 这几条链路不再依赖把整库 JSON 读进内存，而是直接按 `id`、`source_memory_id` 和稳定排序去查 `memory.db`。当前 `memory.db` 内部已经改成分表结构：轻总表 `memory_registry`、三张类型详情表和一张 `field_records` 表，不再是早期单表 `memory_entries`。
 向量侧仍然保留 `memory_embeddings.npy`、`memory.faiss` 和 `meta_NpyRow-to-id.json`。新增、更新、删除时，主数据先按行写入 `SQLite`，再尽量复用旧向量缓存做增量刷新；只有缓存不再安全可复用时，才退回后台全量重建。
