@@ -4,21 +4,34 @@
 
 ## 运行方式
 
-- Conda 环境名称：`project-beta`
 - 服务入口：`AI-memory/memory-rag-mcp/server.py`
 - 项目配置：`AI-memory/memory-rag-mcp/config/settings.yaml`
 - 传输方式：`stdio`
 
 ## 项目特点
 
-**内部记忆类型**  
-"field_record" 内部类型（仅为了提升召回，不开放给外部接口使用）  
-**目的**：为了解决**粒度不一致**的问题（比如单条记忆太大quary太小）导致检索漏关键信息  
-**字段描述**：在每一条记忆详细入库之后，也顺便把该条记忆的所有入库字段单独拆出来，作为一条 memory_kind: field_record 类型的记忆，再入一次库
+**SQLite 作为主数据来源接入**
+当前主数据事实源已经收口到 `SQLite`。这里具体指：`save / update / delete / get_details / timeline` 这几条链路不再依赖把整库 JSON 读进内存，而是直接按 `id`、`source_memory_id` 和稳定排序去查 `memory.db`。当前 `memory.db` 内部已经改成分表结构：轻总表 `memory_registry`、三张类型详情表和一张 `field_records` 表，不再是早期单表 `memory_entries`。
+向量侧仍然保留 `memory_embeddings.npy`、`memory.faiss` 和 `meta_NpyRow-to-id.json`。新增、更新、删除时，主数据先按行写入 `SQLite`，再尽量复用旧向量缓存做增量刷新；只有缓存不再安全可复用时，才退回后台全量重建。
+
+**多种记忆类型**
+使用方面，不只存一种记忆，而是明确分成 project_record、chat_event、fact 三种公共记忆类型，分别对应项目问题沉淀、普通会话事件、自动提取的长期事实。
+
+**field_record 内部记忆类型**
+该记忆类型不作为返回，仅为了提升召回，在 save 时由服务端自动拆分记忆的每个字段分别存储一遍，并且 search 调用时不会返回给用户
+**目的**：为了解决**粒度不一致**的问题（比如单条记忆太大 quary 太小）导致检索漏关键信息
+**字段描述**：在每一条记忆详细入库之后，也顺便把该条记忆中真正参与拆分的字段单独存成`field_record`。当前物理表只保留 `source_memory_id`、`source_field_name`、字段值文、字段值 JSON、指纹和时间等最小必要字段。
+
+**本地 embedding 缓存和增量更新**
+在性能上重点做了“少重复 embedding”。这里具体指：优先走本地 embedding 缓存和增量更新，只有缓存失效或条件不满足时才退回后台全量重建。
+
+它的运行参数不是散在环境变量里，而是统一收口在 config/settings.yaml。这里具体指：server、paths、embedding、memory、summary、search、retrieval、results 都在一份 YAML 里管理。
+
+
 
 ## 项目配置文件
 
-- 当前不再通过环境变量覆盖模型路径和设备。
+- 不再通过环境变量覆盖模型路径和设备。
 - 运行参数统一放在：`AI-memory/memory-rag-mcp/config/settings.yaml`
 - 这份 YAML 里已经按类别收好了：
   - `server`
@@ -32,8 +45,8 @@
 - 代码启动时会直接读取这份 YAML，并把它收口成当前运行常量。
 
 ## 项目 Requirements
-
-如果你的目标是“后面把这个项目传到 GitHub，clone 下来后直接安装依赖并在本地继续使用”，最少需要看清两类东西：代码仓库里会带什么，以及哪些私有资产需要你自己接回本地。
+如果你准备 clone 这个仓库并在自己的机器上继续使用，最少需要先看清两类东西：
+1.代码仓库里会带什么 2.哪些私有资产需要你自己准备或接回本地。
 
 ### clone 仓库后即可获得的内容
 
@@ -47,7 +60,7 @@
 - `config/settings.yaml` 的位置固定就是项目内的 `config/settings.yaml`
 - clone 完成后，直接在项目根目录执行 `pip install -r requirements.txt` 即可安装当前项目的 Python 直接依赖
 
-### 不会随仓库自动带上的私有资产
+### 私有资产（不会随仓库自动带上）
 
 - 本地 embedding 模型目录
   - 实际位置由 `config/settings.yaml` 里的 `embedding.model_path` 决定
@@ -55,22 +68,24 @@
 - 私有记忆数据目录
   - `AI-memory/memory-rag-mcp-data/`
   - 如果要延续旧记忆，里面至少应包含：
-    - `memory.json`
+    - `memory.db`
     - `memory_embeddings.npy`
     - `memory.faiss`
-    - `memory_meta.json`
+    - `meta_NpyRow-to-id.json`
 - 人类视图文件
   - `AI-memory/memory-rag-mcp-data/RAG记忆库时间线.md`
   - 这个文件不是主数据源，但建议跟数据目录一起接回，避免换机后丢失人类可读视图
 - Codex 本地注册配置
   - 新机器上的 `C:\Users\<你的用户名>\.codex\config.toml` 里需要注册 `memory-rag-mcp`
+  - 推荐把 `command` 直接指向目标 Python 环境里的 `python.exe`，再用 `args = ["-u", "<server.py 路径>"]` 启动
+  - 这样少一层 `conda run -> cmd/bat -> python` 包装，后面排查残留进程时更容易看清到底是哪一个脚本在运行
 
 ### 两种使用模式
 
 - 空库启动模式
   - 只接代码和本地模型，不接旧数据
   - 这种情况下也可以直接开始 `save`
-  - 首次保存后，服务会自动生成主数据、时间线、embedding 缓存、FAISS 和 meta
+  - 首次保存后，服务会自动生成 `memory.db`、时间线、embedding 缓存、FAISS 和 meta
 - 旧记忆延续模式
   - 在上面的基础上，再把私有模型和私有记忆数据接回本地
   - 这样 `search` 才能直接命中历史 AI 记忆
@@ -79,26 +94,33 @@
 
 - 本地 embedding 模型目录
 - `memory-rag-mcp-data/` 里的私有记忆数据文件
-- Codex 的 MCP 注册块
+- Codex 的 MCP 注册块（推荐 direct python）
 
 ## 记忆文件位置
 
-- `AI-memory/memory-rag-mcp-data/memory.json`
+- `AI-memory/memory-rag-mcp-data/memory.db`
 - `AI-memory/memory-rag-mcp-data/memory_embeddings.npy`
 - `AI-memory/memory-rag-mcp-data/memory.faiss`
-- `AI-memory/memory-rag-mcp-data/memory_meta.json`
+- `AI-memory/memory-rag-mcp-data/meta_NpyRow-to-id.json`
 - `AI-memory/memory-rag-mcp-data/RAG记忆库时间线.md`
 
 其中：
 
 - `memory-rag-mcp-data/` 目录承载项目记忆系统自己的数据和索引文件，避免把技术文件散落在 `AI-memory` 根目录。
-- `memory.json` 是唯一主数据源，保存完整字段。
-- `memory_embeddings.npy` 是已计算向量的本地缓存矩阵，用来减少重复 embedding。
-- `memory.faiss` 是由本地向量缓存派生出来的搜索结构。
-- `memory_meta.json` 只保存索引元数据、当前检索字段签名以及 `FAISS` 行号到记录 `id` 的映射。
-- `RAG记忆库时间线.md` 放在 `memory-rag-mcp-data/` 目录中，作为按最近更新时间查看的人类可读视图。
+- `memory.db`
+  - 当前唯一主数据源，保存各个记忆的完整内容。
+  - 当前库内结构是：`memory_registry`、`project_records`、`chat_events`、`facts`、`field_records`。
+- `memory_embeddings.npy`
+  - 一张原始向量表，即已计算向量的本地缓存矩阵文件，用来减少重复 embedding。实现增量 embedding
+- `memory.faiss`
+  - 该文件是可直接加载查询的 Flat-IP 索引对象，即建库时读取 .npy 做出来的搜索结构/检索目录/索引对象，查询就查它
+  - FAISS 在 search 是直接读取复用该文件，而不是 .npy 文件
+- `meta_NpyRow-to-id.json`
+  - 索引配套元数据，主要记 3 类东西：用了哪个 embedding 模型、检索字段签名、FAISS 行号到记录 id 的映射。
+- `RAG记忆库时间线.md`
+  - 放在 `memory-rag-mcp-data/` 目录中，给人看的时间线视图，按最近更新时间整理，不是主数据源。
 
-# 工具接口描述
+# 接口描述
 
 ## 调用约定
 
@@ -106,25 +128,42 @@
 - 调用 `save` / `update` 前，应先把内容整理成结构化字段；如果用户指定了现成文档，应先阅读文档，再提取并补充结构化信息。
 - `detailed_summary` 是正式入库字段，不是临时中间值；写进去的内容会直接进入主数据。
 - 当前不接受外部传业务时间字段；`created_at` 和 `updated_at` 都由服务端自动维护。
-- `memory.json` 是唯一事实源；向量索引、时间线和内部 `field_record` 都是基于主数据生成的衍生产物。
+- `memory.db` 是唯一事实源；向量索引、时间线和内部 `field_record` 都是基于主数据生成的衍生产物。
+- 当前 SQLite 主数据采用分表结构：轻总表负责路由，`project_record / chat_event / fact` 各自有详情表，`field_record` 独立成最小必要字段表。
 
 ## 接口总览
 
 - `save`
   - 作用：保存一条高信息密度的项目经验、会话事件或事实记忆。
-  - 副作用：更新主数据 JSON、重写时间线 Markdown，并优先复用本地 embedding 缓存来刷新向量索引。
+  - 副作用：更新 `SQLite` 主数据、重写时间线 Markdown，并优先复用本地 embedding 缓存来刷新向量索引。
+- `save_chatEvent`
+  - 作用：专门保存一条 `chat_event` 会话事件记忆。
+  - 返回方式：固定按 `chat_event` 新事件写入，返回字段与现有 `save` 一致；只有完全重复时才按现有去重规则复用旧记录。
 - `update`
   - 作用：按 `id` 更新一条已有记忆。
-  - 返回方式：补丁式修改主数据字段；如果规范化后内容未变化，返回 `updated=false` 且不重建。
+  - 返回方式：补丁式修改原类型下的主数据字段；如果规范化后内容未变化，返回 `updated=false` 且不重建。当前不再用 `update` 做记忆类型切换。
 - `search`
   - 作用：按向量相似度检索最相关的历史记忆候选。
-  - 返回方式：先查 `FAISS`，再回源主数据 JSON，只返回轻量候选字段和相似度分数；如果命中的是内部字段级子记忆，会先折叠回源到主记忆。
+  - 返回方式：先查 `FAISS`，再按命中 id 回源 `SQLite` 主数据，只返回轻量候选字段和相似度分数；如果命中的是内部字段级子记忆，会先折叠回源到主记忆。
 - `get_details_by_ids`
   - 作用：按一批记录 `ids` 读取完整详情。
-  - 返回方式：直接回源主数据 JSON，统一返回 `records` 列表和 `missing_ids`；仅在显式调试模式下附带内部调试字段。
+  - 返回方式：直接按 `id` 回源 `SQLite` 主数据，统一返回 `records` 列表和 `missing_ids`；仅在显式调试模式下附带内部调试字段。
 - `delete_by_ids`
   - 作用：按一批记录 `ids` 从主数据中硬删除记忆。
   - 返回方式：删除命中的记录、同步更新时间线，并基于本地 embedding 缓存重建向量索引后返回最小删除结果。
+
+## 分表迁移
+
+- 当前版本不再兼容旧单表 `memory_entries` 直接启动。
+- 如果你的 `memory.db` 还是旧单表结构，先停掉 MCP，再运行：
+  - `python scripts/migrate_split_tables.py`
+- 脚本会先备份当前数据库为 `memory.pre_split_tables.backup.db`，再把旧单表记录拆到：
+  - `memory_registry`
+  - `project_records`
+  - `chat_events`
+  - `facts`
+  - `field_records`
+- 迁移完成后，新代码才会继续正常启动。
 
 ## `save` 接口
 
@@ -132,10 +171,13 @@
 
 - 用于把 AI 已经整理好的结构化记忆写入长期库。
 - `save` 不做“读文档并理解”的工作；那部分是 AI 在调用前完成的。
+- 服务端不会替调用方判断内容真假；调用方应先完成证据确认和内容整理，再提交入库。
+- 正式入库内容只允许包含已验证的事实、用户明确实践过的操作，或能被文件、截图、日志、命令输出直接证明的结论；不得补写未经验证的推测、归因或建议。
+- 如果已有相似且已验证的内容，优先融合进已有记录或本次更新，不要重复堆新的近似表述。
 - 如果本次写入和历史记录完全一致，`save` 会去重，并返回 `deduped=true`。
 - 每次 `save` 成功后，都会同步刷新时间线和向量索引；当前实现会优先只对新记录做增量 embedding。
 - 如果缓存缺失或当前库状态无法安全复用旧向量，服务端会先写入主数据，再把全量 embedding 放到后台执行，并返回一个 `rebuilding` 提示；这段时间 `search` 不可用。
-- 推荐使用流程：
+- 一般 ai 的调用流程如下：
   1. 如果本次要存的是非事件记忆，先 `search` 看看是否已有与当前主题相近的记忆。
   2. 如果已存在相近记忆，优先判断是否应该对已有记忆执行 `update`。
   3. 如果不存在合适的已有记忆，再调用 `save` 新建一条记忆。
@@ -154,27 +196,34 @@
 - `title`
   - 必填。
   - 记录标题，用一句话概括本次记忆。
+  - 只写已验证事实、用户明确实践过的操作，或有直接证据支撑的结论；不要补写未经验证的推测、归因或建议。
 - `short_summary`
   - 必填。
   - 面向嵌入检索的简短摘要，建议控制在一两句话内。
   - 这个字段由 AI 主动总结，放在 `retrieval_fields` 的第二位，优先服务于 512 token 预算下的检索命中率。
+  - 内容只应来自已验证事实、用户明确实践过的操作，或有直接证据支撑的结论；如果与已有已验证内容相似，优先融合整理，不要重复新编近似说法。
 - `detailed_summary`
   - 必填。
   - AI 整理后的最终详细总结，也是正式入库正文。
   - 这个字段默认不参与 embedding 拼接，主要用于详情阅读和长期归档。
   - 如果用户指定了参考文档，这里的信息不能比参考文档更少。
+  - 只允许写入已验证事实、用户明确实践过的操作，或能被文件、截图、日志、命令输出直接证明的结论，不得补写未经验证的推测、归因或建议。
 - `problem_background`
   - `project_record` 必填，其他类型可选。
   - 用于保存问题以及背景、故障现象，以及这条已解决问题为什么值得记录；不要写成流水账。
+  - 只写已验证事实、用户明确实践过的操作，或有直接证据支撑的结论；如果与已有已验证内容相似，优先融合整理。
 - `analysis`
   - `project_record` 必填，其他类型可选。
-  - 用于保存原因判断、方案分析、取舍依据、排查结论，以及为什么这样判断、为什么这么做；要留下后续可复用的思路。
+  - 用于保存已证实的原因判断、取舍依据和排查结论，以及为什么这样判断、为什么这么做；要留下后续可复用的思路。
+  - 这里只允许写入已验证事实、用户明确实践过的操作，或能被文件、截图、日志、命令输出直接证明的结论；不要写怀疑方向、猜测性归因或未证实判断。
 - `action_steps`
   - `project_record` 必填，其他类型可选。
   - 用于保存真正解决问题时执行的关键步骤、命令、操作顺序或具体处理动作，不要堆无用流水过程。
+  - 只写用户明确实践过的操作，或有文件、截图、日志、命令输出可直接证明的动作和结果；不要补写未经实践的建议性步骤。
 - `validation_result`
   - `project_record` 必填，其他类型可选。
   - 用于保存测试、验证、复现是否消失、验收结果等验证结论；默认应记录已经解决并验证过的问题。
+  - 这里只写已验证结果或能被文件、截图、日志、命令输出直接证明的结论；不要补写未经验证的判断。
 - `tags`
   - 可选传入，但最终存储必有。
   - 推荐由 AI 先生成标签数组。
@@ -280,7 +329,53 @@ save：先规范化新记录，读老主数据进内存，然后拼接成新主�
 然后脚本根据这个 dict 以及新主数据的 id 顺序（current_entry_ids ），去重拼并落盘新faiss、meta和npy：  
 memory_embeddings.npy <- rebuilt_embeddings  
 memory.faiss <- 基于 rebuilt_embeddings 重建  
-memory_meta.json <- sorted_entries 的 id 顺序
+meta_NpyRow-to-id.json <- sorted_entries 的 id 顺序
+
+## `save_chatEvent` 接口
+
+### 功能说明
+
+- 专门用于保存一条 `chat_event` 会话事件记忆。
+- 适合保存会话中的片段性、情境性、带时间顺序的事件痕迹。
+- 默认策略是新存，不因为主题相近、人物相近或问题相近，就自动合并旧 `chat_event`。
+- 只有在补充刚写入不久的同一事件，或纠正原记录事实错误时，才应优先考虑对旧 `chat_event` 执行 `update`。
+- 服务端不会替调用方判断内容真假；调用方应先完成证据确认和内容整理，再提交入库。
+- 正式入库内容只允许包含已验证的事实、用户明确实践过的操作，或能被文件、截图、日志、命令输出直接证明的结论；不得补写未经验证的推测、归因或建议。
+- 如果与已有已验证内容完全一致，接口仍会按现有去重规则返回 `deduped=true`。
+- 返回字段与现有 `save` 完全一致，不新增专属返回字段。
+
+### 输入字段
+
+- `title`
+  - 必填。
+  - 事件标题，用一句话概括这次会话事件。
+  - 只写已验证事实、用户明确实践过的操作，或有直接证据支撑的结论；不要补写未经验证的推测、归因或建议。
+- `short_summary`
+  - 必填。
+  - 面向嵌入检索的简短摘要，建议控制在一两句话内。
+  - 这个字段由 AI 主动总结，放在 `retrieval_fields` 的第二位，优先服务于 512 token 预算下的检索命中率。
+  - 内容只应来自已验证事实、用户明确实践过的操作，或有直接证据支撑的结论；如果与已有已验证内容相似，优先融合整理，不要重复新编近似说法。
+- `detailed_summary`
+  - 必填。
+  - AI 整理后的最终详细总结，也是正式入库正文。
+  - 这个字段默认不参与 embedding 拼接，主要用于详情阅读和长期归档。
+  - 如果用户指定了参考文档，这里的信息不能比参考文档更少。
+  - 只允许写入已验证事实、用户明确实践过的操作，或能被文件、截图、日志、命令输出直接证明的结论，不得补写未经验证的推测、归因或建议。
+- `tags`
+  - 可选传入，但最终存储必有。
+  - 推荐由 AI 先生成标签数组。
+  - 如果缺失，服务端会做基础兜底补全。
+- `source_paths`
+  - 可选。
+  - 普通来源材料路径或链接列表，例如日志、网页、截图、工单链接。
+- `reference_doc_path`
+  - 可选。
+  - 参考文档路径。
+  - 只在“用户指定一份现成文档让 AI 归档”时使用，不与 `source_paths` 混用。
+
+### 返回字段
+
+- 与现有 `save` 完全一致。
 
 ## `update` 接口
 
@@ -288,11 +383,14 @@ memory_meta.json <- sorted_entries 的 id 顺序
 
 - 用于按记录 `id` 对一条已有记忆做补丁式更新。
 - `update` 不是整条记录替换；`changes` 里传什么字段，就只更新什么字段。
+- `changes` 中新增或替换的内容，只允许包含已验证的事实、用户明确实践过的操作，或能被文件、截图、日志、命令输出直接证明的结论；不要把未验证的推测、归因或建议补进已有记录。
+- 如果只是补充已有相似且已验证的内容，优先融合到原记录，而不是制造重复表达。
 - 如果规范化后的结果和当前记录完全一致，接口会返回 `updated=false`，不重建索引，也不刷新 `updated_at`。
 - 如果更新后的内容与另一条已有记录完全一致，接口会直接报冲突，不会自动合并。
-- 当前实现会优先只重算被更新主记忆本体及其 `field_record` 家族的向量。
+- 当前实现会优先只重算被更新主记忆本体，以及本次受影响字段对应的 `field_record` 子记录向量。
 - 如果缓存缺失或当前库状态无法安全复用旧向量，服务端会先写入主数据，再把全量 embedding 放到后台执行，并返回一个 `rebuilding` 提示；这段时间 `search` 不可用。
 - `field_record` 属于内部索引资产，不能通过 `update` 直接修改。
+- `update` 不再允许修改 `memory_kind`；如果要把 `chat_event` 改成 `project_record`，应重新整理内容后调用 `save` 新存，必要时再调用 `delete_by_ids` 删除旧记录。
 
 ### 输入字段
 
@@ -302,8 +400,9 @@ memory_meta.json <- sorted_entries 的 id 顺序
 - `changes`
   - 必填。
   - 一个补丁对象，只传本次要修改的业务字段。
+  - 传入的业务字段值只应包含已验证事实、用户明确实践过的操作，或能被文件、截图、日志、命令输出直接证明的结论；不要把未验证的推测、归因或建议写成更新内容。
+  - 如果与原记录或其他已有记录中的已验证内容相似，优先融合整理，不要重复补一条近似说法。
   - 允许字段包括：
-    - `memory_kind`
     - `title`
     - `short_summary`
     - `detailed_summary`
@@ -314,6 +413,7 @@ memory_meta.json <- sorted_entries 的 id 顺序
     - `tags`
     - `source_paths`
     - `reference_doc_path`
+  - 如果需要切换记忆类型，不要把 `memory_kind` 塞进 `changes`；应改为调用 `save` 新建正确类型，再按需要删除旧记录。
   - 不允许直接修改：
     - `id`
     - `fingerprint`
@@ -372,7 +472,7 @@ memory_meta.json <- sorted_entries 的 id 顺序
 ### 功能说明
 
 - 用于按语义相似度检索历史项目经验、会话事件和事实记忆。
-- `search` 不直接从时间线 Markdown 检索，而是先查 `FAISS`，再用 `meta` 中的 `row_to_id` 回源主数据 JSON。
+- `search` 不直接从时间线 Markdown 检索，而是先查 `FAISS`，再用 `meta` 中的 `row_to_id` 回源 `SQLite` 主数据。
 - `search` 只负责返回轻量候选结果，不承担完整详情读取。
 - 如果命中的是内部 `field_record`，服务端会先折叠回源到它的源头主记忆，再把主记忆返回给调用方。
 - 如果需要完整字段，应继续调用 `get_details_by_ids`。
@@ -534,39 +634,36 @@ memory_meta.json <- sorted_entries 的 id 顺序
 
 ## 当前实现特点
 
-- `search` 会先命中 `FAISS`，再回源到 `memory.json` 返回轻量候选字段。
+- `search` 会先命中 `FAISS`，再回源到 `memory.db` 返回轻量候选字段。
 - 向量索引里同时包含主记忆和内部 `field_record`；`search` 命中 `field_record` 时会折叠回源到主记忆，并用 `matched_fields` 解释命中来源。
 - `get_details_by_ids` 是完整详情的唯一读取入口。
 - `delete_by_ids` 会在主数据删除成功后同步更新时间线，并基于本地 embedding 缓存重建向量索引，不会重复调用 embedding 模型。
-- 服务端内部会自动生成检索文本，不再接收外部传入的 `memory_text`。
 - `detailed_summary` 会保留在主数据里，但默认不进入检索文本，以避免 CPU 全量重建时被长正文拖慢。
-- 当前索引链路已经分成四层：主数据 JSON、embedding 缓存矩阵、FAISS 索引、meta 映射；优化重点是减少重复 embedding，而不是完全不重建 FAISS。
+- 当前索引链路已经分成四层：`SQLite` 主数据、embedding 缓存矩阵、FAISS 索引、meta 映射；优化重点是减少重复 embedding，而不是完全不重建 FAISS。
 - `fact` 走同库新类型，不单独建第二套 store/index；当前版本不做自动提纯或自动分片。
-- 旧主数据里的 `chat_fragment` 会在读写时迁移为 `chat_event`，旧的 `knowledge_record` 会迁移为 `fact`。
 - `field_record` 现在按 one-hot 形态存储：`source_field_name` 是什么，就只让那个字段非空；向量化时也只取该字段原值，不再混入额外摘要壳。
 - `field_record` 会跟随主记忆自动生成、同步和删除，但不会进入时间线，也不会计入对外展示的 `total_entries`。
-- 现有数据会在读写时自动按新结构兼容，不需要手工迁移旧版 `memory_text` 字段。
 - 向量加载和归一化逻辑在当前目录下的 `embedding_utils.py` 中，不再依赖其他项目文件。
 
-# 一键部署
+# 一键部署流程
 
 ## 模型准备与配置
 
-部署前需要先准备本地 embedding 模型。GitHub 仓库只包含代码，不附带本地模型文件。
+部署前需要先准备本地 embedding 模型。仓库只包含代码，不附带本地模型文件。
 
-- `embedding.model_path` 的参数意义是：**本地 embedding 模型目录**。
+- `embedding.model_path` 参数的意义是：**本地 embedding 模型目录**。
 - clone 仓库后，需要先自行下载模型，再把这个参数改成你自己机器上的实际模型目录。
-- 改完后要重启 MCP 或重新加载 Codex 配置，并触发一次索引重建或执行一次 `save`，让新的模型配置真正生效。
+- 改完后重启 MCP 或重新加载 Codex 配置，并触发一次索引重建（比如调用一次 `save`），让新的模型生效。
+- 如果个人资产原有模型与配置的模型不一致
 
 ### 模型参数速查表
 
 | 模型名      | 下载链接                                   | 模型类型                        | 最大序列长度 | 向量维度 | 适用场景                                             | 当前定位 |
 | ----------- | ------------------------------------------ | ------------------------------- | ------------ | -------- | ---------------------------------------------------- | -------- |
 | `bge-m3`    | `https://huggingface.co/BAAI/bge-m3`       | 多语言 embedding 模型           | `8192`       | `1024`   | 更适合长总结、长问题背景、长操作步骤的检索           | 默认模型 |
-| `m3e-large` | `https://huggingface.co/moka-ai/m3e-large` | Sentence Transformers / BERT 系 | `512`        | `1024`   | 适合较短中文语义检索；当前主要问题是长检索文本会截断 | 回退模型 |
+| `m3e-large` | `https://huggingface.co/moka-ai/m3e-large` | Sentence Transformers / BERT 系 | `512`        | `1024`   | 适合较短中文语义检索；当前主要问题是长检索文本会截断 | 低性能模型 |
 
 参数口径说明：
-
 - `m3e-large` 的参数来自其 Hugging Face 模型配置文件。
 - `bge-m3` 的参数来自其 Hugging Face 模型配置文件与官方 README。
 
@@ -575,24 +672,17 @@ memory_meta.json <- sorted_entries 的 id 顺序
 1. 从 `https://huggingface.co/BAAI/bge-m3` 下载模型到你的本地目录。
 2. 修改 `config/settings.yaml` 里的 `embedding.model_path`，把它指向你自己的 `bge-m3` 本地模型目录。
 3. 重启 MCP 或重新加载 Codex 配置。
-4. 触发一次索引重建或执行一次 `save`，确认 `memory.faiss` 和 `memory_meta.json` 已按新模型重建。
+4. 触发一次索引重建或执行一次 `save`，确认 `memory.faiss` 和 `meta_NpyRow-to-id.json` 已按新模型重建。
 
-补充说明：
+补充说明：建库暂时用cpu，不包含 CUDA 环境整改
 
-- `bge-m3` 的主要收益是把上下文长度从 `512` 提升到更长级别，更适合当前这类高信息密度的长归档文本检索。
-- 当前项目虽然有 GPU 硬件，但这次切换不包含 CUDA 环境整改，先按现有环境完成模型替换和重建。
-
-### 切换到 `m3e-large`（回退）
-
+### 切换到 `m3e-large`
 1. 从 `https://huggingface.co/moka-ai/m3e-large` 下载模型到你的本地目录。
 2. 修改 `config/settings.yaml` 里的 `embedding.model_path`，把它指向你自己的 `m3e-large` 本地模型目录。
 3. 重启 MCP 或重新加载 Codex 配置。
-4. 触发一次索引重建或执行一次 `save`，确认 `memory.faiss` 和 `memory_meta.json` 已按回退模型重建。
+4. 触发一次索引重建或执行一次 `save`，确认 `memory.faiss` 和 `meta_NpyRow-to-id.json` 已按回退模型重建。
 
-补充说明：
-
-- `m3e-large` 当前保留作为回退模型。
-- 它的主要限制是 `512 token`，对较长问题背景、分析、处理步骤这类复杂项目记录，截断风险更高。
+补充说明：`m3e-large` 的处理信息长度相对低一些，`512 token`，对较长问题背景、分析、处理步骤这类复杂项目记录，截断风险更高。
 
 默认使用方式：
 
@@ -609,13 +699,57 @@ memory_meta.json <- sorted_entries 的 id 顺序
 5. 准备本地 embedding 模型，并按上面的“模型准备与配置”完成下载和参数修改
 6. 如果只是想把项目跑起来，不接旧数据也可以，后续直接开始 `save` 即可
 7. 如果想继续使用旧 AI 记忆，再把私有数据目录 `memory-rag-mcp-data/` 整体接回本地；时间线文件现在也包含在这个目录里
-8. 在 `~/.codex/config.toml` 里注册 `memory-rag-mcp`(可以让ai完成)
+8. 按下方“`MCP 注册（推荐 direct python）`”完成 `~/.codex/config.toml` 注册（可以让 AI 协助生成）
 9. 做一次最小校验：
    - `python -m py_compile server.py`
    - 再执行一次 `search` 冒烟测试，确认服务可用
 
-要点说明：
+## MCP 注册（推荐 direct python）
 
-- `requirements.txt` 只能解决 Python 依赖安装问题
-- 本地 embedding 模型和私有记忆数据不会随 GitHub 仓库自动带上
-- `settings.yaml` 的位置不需要改，真正可能需要按本机调整的是它里面的 `paths.*`
+推荐直接使用目标 Python 环境里的 `python.exe` 启动 `server.py`。Windows 示例：
+
+```toml
+[mcp_servers.memory-rag-mcp]
+type = "stdio"
+command = "C:\\path\\to\\your-env\\python.exe"
+args = ["-u", "C:\\path\\to\\memory-rag-mcp\\server.py"]
+enabled = true
+```
+
+参数说明：
+
+- `command`
+  - 指向安装好依赖（ `faiss-cpu`、`mcp`、`sentence-transformers` 等）的环境内 `python.exe`
+- `args[0]`
+  - `-u` 表示关闭 Python 标准输出缓冲
+  - 这里具体指：`stdio` 模式下，服务端的输入输出会更直接，不容易因为缓冲区延后暴露问题
+- `args[1]`
+  - 指向本仓库里的 `server.py`
+- `enabled`
+  - 当值为 true，codex 才会实际注册并启动这个 MCP server
+
+为什么推荐这样写：
+
+- 不用 conda 启动方式，少一层 `conda run -> cmd/bat -> python` 包装，进程结构更简单
+- 更容易把 `stdio` 会话和真正跑 `server.py` 的进程对应起来
+- 后面如果任务管理器里出现很多 `python.exe`，更容易按命令行归因
+
+## 排障备注：conda 注册方式
+
+如果你用的是下面这种 `conda run` 写法：
+
+```toml
+[mcp_servers.memory-rag-mcp]
+type = "stdio"
+command = "C:\\path\\to\\miniconda3\\Scripts\\conda.exe"
+args = ["run", "--no-capture-output", "-n", "<env-name>", "python", "C:\\path\\to\\memory-rag-mcp\\server.py"]
+enabled = true
+```
+
+它也能用，但会由于多出 `conda-script.py run` 这一层。导致任务管理器里可能同时出现包装进程和真正的 Python 进程，后面会出现残留了一堆 `python.exe`进程的问题。这个问题暂时没解决
+
+看到很多 `python.exe` 时，先看下面三样：
+
+- 命令行是不是直接类似 `C:\\path\\to\\your-env\\python.exe -u C:\\path\\to\\memory-rag-mcp\\server.py`
+- 命令行里有没有 `conda-script.py run --no-capture-output`
+- 父进程是谁；如果父进程已经没了，但 `server.py` 还在跑，就说明本地清理没有跟上
