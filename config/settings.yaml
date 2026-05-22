@@ -12,20 +12,23 @@ server:
 paths:
   ai_memory_dir: .. # 代码所在的根目录
   data_dir: ../memory-rag-mcp-data # 本项目的数据目录。
-  store_path: ../memory-rag-mcp-data/memory.json # 主数据 JSON 文件路径。
   timeline_path: ../memory-rag-mcp-data/RAG记忆库时间线.md # 时间线 Markdown 文件路径。
   embeddings_path: ../memory-rag-mcp-data/memory_embeddings.npy # 本地 embedding 缓存矩阵文件路径。
   index_path: ../memory-rag-mcp-data/memory.faiss # FAISS 向量索引文件路径。
-  meta_path: ../memory-rag-mcp-data/memory_meta.json # 向量索引元数据文件路径。
+  meta_path: ../memory-rag-mcp-data/meta_NpyRow-to-id.json # 向量索引元数据文件路径。
+
+# 主数据存储后端配置。
+storage:
+  backend: sqlite # 当前主数据存储后端；默认使用 SQLite。
+  sqlite_path: ../memory-rag-mcp-data/memory.db # SQLite 主数据文件路径。
 
 # embedding 模型与推理设备配置。
 embedding:
   model_path: ../models/bge-m3 # 本地 embedding 模型目录。
   device: cpu # embedding 推理设备，例如 cpu 或 cuda。
 
-# 主数据结构和记忆类型相关配置。
+# 记忆类型相关配置。
 memory:
-  store_version: 8 # 主数据结构版本号。
   kind_values: # 允许的记忆类型枚举值。
     - project_record
     - chat_event

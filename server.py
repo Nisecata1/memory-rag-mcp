@@ -1,7 +1,7 @@
 """memory-rag-mcp 的服务入口模块。
 
 这个模块只保留三层内容：
-1. FastMCP 服务对象创建。
+1. FastMCP 服务对象创建的相关语句。
 2. 每个工具直接调用的高层主流程函数。
 3. 对外暴露的 MCP 工具接口和 main() 启动入口。
 """
@@ -37,15 +37,18 @@ from server_utils import (
     build_fact_extraction_reminder,
     build_model_fingerprint,
     build_payload,
-    build_store_entry_map,
     build_update_candidate_record,
+    count_public_store_entries,
     encode_texts,
     ensure_write_operations_allowed,
+    fetch_entry_family_by_source_ids,
+    fetch_public_entry_by_fingerprint,
+    fetch_public_timeline_summary_entries,
+    fetch_store_entries_by_ids,
+    fetch_store_entry_by_id,
     get_embedder,
     is_field_record_entry,
-    list_public_entries,
     load_rebuild_state,
-    load_store,
     normalize_record_ids,
     now_iso,
     payload_fingerprint,
@@ -53,7 +56,6 @@ from server_utils import (
     resolve_embed_device,
     resolve_embed_model_path,
     RETRIEVAL_FIELD_SIGNATURE,
-    sort_entries,
     update_store_and_rebuild,
     validate_update_changes,
 )
@@ -69,13 +71,14 @@ server = FastMCP(
 )
 
 # 按多条记录 id 回源主数据并返回完整详情记忆；保留在本文件是为了让“接口 -> 主数据回源 -> 结果裁剪”的链路仍能在入口层直接看清。
-# 直接读 memory.json，按 id 回源，不碰 meta
+# 这里直接按 id 查 SQLite 主数据，不碰 meta。
 def get_detail_records_by_ids(record_ids: list[str], include_debug: bool = False) -> dict[str, Any]:
     normalized_ids = normalize_record_ids(record_ids)
-
-    loaded_store = load_store()
-    store_entries = list(loaded_store.get("entries") or [])
-    store_entry_map = build_store_entry_map(store_entries)
+    fetched_entries = fetch_store_entries_by_ids(normalized_ids)
+    store_entry_map = {
+        str(entry.get("id") or "").strip(): entry
+        for entry in fetched_entries
+    }
     records: list[dict[str, Any]] = []
     missing_ids: list[str] = []
 
@@ -115,9 +118,11 @@ def delete_records_by_ids(
 ) -> dict[str, Any]:
     ensure_write_operations_allowed()
     normalized_ids = normalize_record_ids(record_ids)
-    loaded_store = load_store()
-    store_entries = list(loaded_store.get("entries") or [])
-    store_entry_map = build_store_entry_map(store_entries)
+    fetched_entries = fetch_store_entries_by_ids(normalized_ids)
+    store_entry_map = {
+        str(entry.get("id") or "").strip(): entry
+        for entry in fetched_entries
+    }
     deleted_ids: list[str] = []
     missing_ids: list[str] = []
 
@@ -137,15 +142,7 @@ def delete_records_by_ids(
             "missing_ids": missing_ids,
             "deleted_count": 0,
         }
-
-    deleted_id_set = set(deleted_ids)
-    remaining_entries = [
-        entry
-        for entry in store_entries
-        if str(entry.get("id") or "").strip() not in deleted_id_set
-    ]
     rebuild_result = update_store_and_rebuild(
-        remaining_entries,
         embedder=embedder,
         model_path=model_path,
         deleted_ids=deleted_ids,
@@ -164,7 +161,7 @@ def delete_records_by_ids(
     return result
 
 
-# 查询向量索引，并回源主 JSON 返回轻量候选结果；保留在本文件是为了让“查询输入 -> 向量检索 -> 主数据回源”的主流程保持可读。
+# 查询向量索引，并回源主 SQLite 返回轻量候选结果；保留在本文件是为了让“查询输入 -> 向量检索 -> 主数据回源”的主流程保持可读。
 def search_records(
     query: str,
     top_k: int | None = None,
@@ -182,19 +179,15 @@ def search_records(
         meta = json.load(handle)
     if not isinstance(meta, dict):
         raise RuntimeError(f"{META_PATH.name} must contain an object")
-    if "row_to_id" not in meta:
-        raise RuntimeError("Vector meta file uses an old schema. Rebuild the index before searching.")
-    row_to_id = meta.get("row_to_id") or []
+    row_to_id = meta.get("row_to_id")
     if not isinstance(row_to_id, list):
-        raise RuntimeError(f"{META_PATH.name} must contain a row_to_id list")
-    if not row_to_id:
+        raise RuntimeError(f"{META_PATH.name} must contain row_to_id as a string list")
+    if not all(isinstance(row_item, str) and str(row_item or "").strip() for row_item in row_to_id):
+        raise RuntimeError(f"{META_PATH.name} row_to_id must contain only non-empty strings")
+    row_ids = [str(row_item or "").strip() for row_item in row_to_id]
+    if not row_ids:
         return []
 
-    loaded_store = load_store()
-    store_entries = list(loaded_store.get("entries") or [])
-    store_entry_map = build_store_entry_map(store_entries)
-    public_entries = list_public_entries(store_entries)
-    public_entry_map = build_store_entry_map(public_entries)
     if not INDEX_PATH.exists():
         raise RuntimeError("Vector index file does not exist yet. Save at least one record first.")
     index = faiss.read_index(str(INDEX_PATH))
@@ -220,21 +213,56 @@ def search_records(
         )
 
     resolved_top_k = 5 if top_k is None else max(1, min(int(top_k), MAX_TOP_K))
-    search_count = len(row_to_id)
+    search_count = len(row_ids)
+    # indices 是 FAISS 返回的 [[row_index_0, row_index_1, ...]] 形状的数组
+    # 每个值就是向量在索引中的行号（位置编号）。
     scores, indices = index.search(query_vector, search_count)
+
+    direct_entry_ids: set[str] = set()
+    for row_index in indices[0].tolist():
+        if row_index < 0 or row_index >= len(row_ids):
+            continue
+        entry_id = str(row_ids[row_index] or "").strip()
+        if not entry_id:
+            continue
+        direct_entry_ids.add(entry_id)
+    fetched_direct_entries = fetch_store_entries_by_ids(list(direct_entry_ids)) if direct_entry_ids else []
+    direct_entry_map = {
+        str(entry.get("id") or "").strip(): entry
+        for entry in fetched_direct_entries
+    }
+    source_memory_ids = {
+        str(entry.get("source_memory_id") or "").strip()
+        for entry in fetched_direct_entries
+        if is_field_record_entry(entry) and str(entry.get("source_memory_id") or "").strip()
+    }
+    family_entries = fetch_entry_family_by_source_ids(source_memory_ids) if source_memory_ids else []
+    family_entry_map = {
+        str(entry.get("id") or "").strip(): entry
+        for entry in family_entries
+    }
+    public_entry_map = {
+        str(entry.get("id") or "").strip(): entry
+        for entry in fetched_direct_entries
+        if not is_field_record_entry(entry)
+    }
+    public_entry_map.update(
+        {
+        str(entry.get("id") or "").strip(): entry
+        for entry in family_entries
+        if not is_field_record_entry(entry)
+        }
+    )
 
     aggregated_results: dict[str, dict[str, Any]] = {}
     matched_field_scores: dict[str, dict[str, float]] = {}
     for row_index, score in zip(indices[0].tolist(), scores[0].tolist()):
-        if row_index < 0 or row_index >= len(row_to_id):
+        if row_index < 0 or row_index >= len(row_ids):
             continue
-        row_item = row_to_id[row_index]
-        if not isinstance(row_item, dict):
-            continue
-        entry_id = str(row_item.get("id") or "").strip()
+        entry_id = str(row_ids[row_index] or "").strip()
         if not entry_id:
             continue
-        matched_entry = store_entry_map.get(entry_id)
+        matched_entry = direct_entry_map.get(entry_id) or family_entry_map.get(entry_id)
         if matched_entry is None:
             continue
         if is_field_record_entry(matched_entry):
@@ -245,9 +273,7 @@ def search_records(
             result_id = source_memory_id
             matched_field_name = str(matched_entry.get("source_field_name") or "").strip()
         else:
-            source_entry = public_entry_map.get(entry_id)
-            if source_entry is None:
-                continue
+            source_entry = matched_entry
             result_id = entry_id
             matched_field_name = ""
         # 轻量候选结果在搜索链路内部直接裁剪字段，避免再跳转到只服务本函数的包装层。
@@ -325,17 +351,13 @@ def save_record(
     )
     fingerprint = payload_fingerprint(payload)
     entry_id = payload_id(fingerprint)
-    loaded_store = load_store()
-    existing_entries = list(loaded_store["entries"])
-    public_existing_entries = list_public_entries(existing_entries)
-    existing = next((item for item in public_existing_entries if item.get("fingerprint") == fingerprint), None)
+    existing = fetch_public_entry_by_fingerprint(fingerprint)
 
     resolved_model_path = model_path or resolve_embed_model_path()
 
     deduped = existing is not None
     if deduped:
-        normalized_existing_entries = sort_entries(public_existing_entries)
-        current_index_stats = {"count": len(existing_entries), "dim": 0}
+        current_index_stats = {"count": count_public_store_entries(), "dim": 0}
         if META_PATH.exists():
             try:
                 with META_PATH.open("r", encoding="utf-8") as handle:
@@ -344,17 +366,15 @@ def save_record(
                     current_index_stats["dim"] = int(current_meta.get("dim") or 0)
             except (OSError, json.JSONDecodeError, ValueError):
                 current_index_stats["dim"] = 0
-        timeline_summary = [
-            f"{entry['updated_at']} | {entry['title']}"
-            for entry in normalized_existing_entries[:3]
-        ]
+        timeline_entries = fetch_public_timeline_summary_entries(limit=3)
+        timeline_summary = [f"{entry['updated_at']} | {entry['title']}" for entry in timeline_entries]
         return {
             "id": existing["id"],
             "updated_at": existing["updated_at"],
             "created_at": existing["created_at"],
             "tags": existing["tags"],
             "deduped": True,
-            "total_entries": len(normalized_existing_entries),
+            "total_entries": count_public_store_entries(),
             "timeline_summary": timeline_summary,
             "index_stats": current_index_stats,
         }
@@ -368,21 +388,17 @@ def save_record(
             "updated_at": created_now,
             **payload,
         }
-        # 这一步只是 Python 列表变成：[A, B, C] + [D] = [A, B, C, D]，还没写盘
-        updated_entries = existing_entries + [saved_entry]
 
     rebuild_result = update_store_and_rebuild(
-        updated_entries,  # 这个是直接拼接的（未排序的）主数据的列表（内存版本）
         embedder=embedder,
         model_path=resolved_model_path,
         appended_entry=saved_entry,  # 这个就是这次新加的这条记忆。作用就是告诉重建函数这是走新增路径，可以复用旧缓存
     )
-    # 这个就是一个 list[dict[str, Any]]，意思是当前整库规范化并排序后的完整记录列表
-    normalized_entries = rebuild_result["normalized_entries"]
+    resolved_entries = rebuild_result["resolved_entries"]
 
     # 把字段拿出来并 return
     normalized_saved_entry = next(
-        (item for item in normalized_entries if item.get("id") == saved_entry["id"]),
+        (item for item in resolved_entries if item.get("id") == saved_entry["id"]),
         saved_entry,
     )
     result = {
@@ -408,7 +424,7 @@ def save_record(
 
 
 # 按 id 对一条已有记忆做补丁式更新；
-# 保留在本文件是为了让“接口输入 -> 主数据补丁 -> 重建触发”的主流程保持可见。
+# 保留在主 server.py 文件是为了让“接口输入 -> 主数据补丁 -> 重建触发”的主流程保持可见。
 def update_record(
     record_id: str,
     changes: dict[str, Any],
@@ -424,13 +440,7 @@ def update_record(
     # 第二块：校验补丁对象，并从主数据里定位这次要更新的源主记忆。
     # 这里仍然只允许更新公共主记忆；field_record 是内部索引资产，不能被外部直接当业务对象修改。
     normalized_changes = validate_update_changes(changes)
-    loaded_store = load_store()  # return dict
-    # existing_entries：整库所有记录的列表
-    existing_entries = list(loaded_store.get("entries") or [])
-    # store_entry_map：把这个列表改造成 id -> 记录 的字典
-    store_entry_map = build_store_entry_map(existing_entries)
-    # source_entry：从这个字典里拿出“本次要更新的那条旧记录”
-    source_entry = store_entry_map.get(normalized_record_id)
+    source_entry = fetch_store_entry_by_id(normalized_record_id)
     if source_entry is None:
         raise ValueError(f"record not found: {normalized_record_id}")
     if is_field_record_entry(source_entry):
@@ -444,8 +454,7 @@ def update_record(
     # 第四块：如果规范化后的候选记录和当前记录 fingerprint 一样，说明这次 update 没有带来真实内容变化。
     # 这种场景直接返回 updated=false，不刷新 updated_at，也不触发任何索引重建。
     if candidate_entry["fingerprint"] == source_entry.get("fingerprint"):
-        normalized_existing_entries = sort_entries(list_public_entries(existing_entries))
-        current_index_stats = {"count": len(existing_entries), "dim": 0}
+        current_index_stats = {"count": count_public_store_entries(), "dim": 0}
         if META_PATH.exists():
             try:
                 with META_PATH.open("r", encoding="utf-8") as handle:
@@ -454,31 +463,24 @@ def update_record(
                     current_index_stats["dim"] = int(current_meta.get("dim") or 0)
             except (OSError, json.JSONDecodeError, ValueError):
                 current_index_stats["dim"] = 0
-        timeline_summary = [
-            f"{entry['updated_at']} | {entry['title']}"
-            for entry in normalized_existing_entries[:3]
-        ]
+        timeline_entries = fetch_public_timeline_summary_entries(limit=3)
+        timeline_summary = [f"{entry['updated_at']} | {entry['title']}" for entry in timeline_entries]
         return {
             "id": source_entry["id"],
             "updated_at": source_entry["updated_at"],
             "created_at": source_entry["created_at"],
             "tags": source_entry["tags"],
             "updated": False,
-            "total_entries": len(normalized_existing_entries),
+            "total_entries": count_public_store_entries(),
             "timeline_summary": timeline_summary,
             "index_stats": current_index_stats,
         }
 
     # 第五块：检查“更新后的内容是否和另一条主记忆完全撞车”。
     # 如果新 fingerprint 已经属于别的主记忆，就直接报冲突；旧记录保持不动，不做隐式合并。
-    conflicting_entry = next(
-        (
-            entry
-            for entry in list_public_entries(existing_entries)
-            if str(entry.get("id") or "").strip() != normalized_record_id
-            and entry.get("fingerprint") == candidate_entry["fingerprint"]
-        ),
-        None,
+    conflicting_entry = fetch_public_entry_by_fingerprint(
+        candidate_entry["fingerprint"],
+        exclude_id=normalized_record_id,
     )
     if conflicting_entry is not None:
         raise ValueError(
@@ -492,26 +494,22 @@ def update_record(
         **candidate_entry,
         "updated_at": updated_at,
     }
-    # updated_entries 就是“把目标那一条替换掉之后的完整记录列表”
-    # Python 的列表推导式，遍历旧列表里的每一条记录，如果这条记录的 id 等于当前要更新的 id，就换成新的 updated_entry；否则原样保留
-    updated_entries = [
-        updated_entry if str(entry.get("id") or "").strip() == normalized_record_id else entry
-        for entry in existing_entries
-    ]
 
     # 第七块：把替换后的完整主数据交给底层统一写回，并显式告诉底层“这次更新了哪个主记忆家族”。
     # 底层会据此只重算该主记忆本体及其 field_record 家族的向量，其余旧向量继续复用。
     rebuild_result = update_store_and_rebuild(
-        updated_entries,
         embedder=embedder,
         model_path=model_path,
+        previous_entry=source_entry,
+        updated_entry=updated_entry,
         updated_source_ids={normalized_record_id},
+        updated_field_names=set(normalized_changes.keys()),
     )
 
     # 第八块：从重建后的整库结果里回捞这条最新记录，再组装成 update 接口的最终返回摘要。
-    normalized_entries = rebuild_result["normalized_entries"]
+    resolved_entries = rebuild_result["resolved_entries"]
     normalized_updated_entry = next(
-        (item for item in normalized_entries if item.get("id") == updated_entry["id"]),
+        (item for item in resolved_entries if item.get("id") == updated_entry["id"]),
         updated_entry,
     )
     result = {
@@ -542,6 +540,8 @@ def update_record(
     description=(
         "保存一条高信息密度的项目经验、会话事件或事实记忆，更新最近更新时间线，并重建 RAG 向量索引。"
         "AI 在调用前应先整理内容；如用户指定了参考文档，AI 应先阅读文档，再提取并补充结构化字段。"
+        "正式入库内容只应包含已验证的事实、用户明确实践过的操作，或能被文件、截图、日志、命令输出直接证明的结论；不要把未验证的推测、归因或建议写成正式记忆。"
+        "如果与已有已验证记忆相似，优先先 search 并融合到已有记录或本次更新里，不要重复堆新的近似表述。"
         "推荐流程：1. 如果本次要存的是非事件记忆，先 search 看看是否已有与当前主题相近的记忆。"
         "2. 如果已存在相近记忆，优先判断是否应该对已有记忆执行 update。"
         "3. 如果不存在合适的已有记忆，再调用 save 新建一条记忆。"
@@ -564,7 +564,7 @@ def save(
     ],
     title: Annotated[
         str,
-        Field(description="必填。记录标题，用一句话概括本次记忆。"),
+        Field(description="必填。记录标题，用一句话概括本次记忆。只写已验证事实、用户明确实践过的操作，或有直接证据支撑的结论；不要补写未经验证的推测、归因或建议。"),
     ],
     short_summary: Annotated[
         str,
@@ -572,6 +572,7 @@ def save(
             description=(
                 "必填。用于嵌入检索的简短摘要，建议控制在一两句话内。"
                 "这个字段需要 AI 主动总结，会放在 retrieval_fields 的第二位。"
+                "内容只应来自已验证事实、用户明确实践过的操作，或有直接证据支撑的结论；如果与已有已验证内容相似，优先融合整理，不要重复新编近似说法。"
             ),
         ),
     ],
@@ -581,6 +582,7 @@ def save(
             description=(
                 "必填。AI 整理后的最终详细总结，也是正式入库字段。"
                 "如果用户指定了参考文档，这里的信息不能比参考文档更少。"
+                "只允许写入已验证事实、用户明确实践过的操作，或能被文件、截图、日志、命令输出直接证明的结论，不得补写未经验证的推测、归因或建议。"
             )
         ),
     ],
@@ -588,28 +590,28 @@ def save(
         str | None,
         Field(
             default=None,
-            description="project_record 必填，其他类型可选。用于保存问题及其背景、故障现象，以及这条已解决问题为什么值得记录；不要写成流水账。",
+            description="project_record 必填，其他类型可选。用于保存问题及其背景、故障现象，以及这条已解决问题为什么值得记录；不要写成流水账。只写已验证事实、用户明确实践过的操作，或有直接证据支撑的结论；如果与已有已验证内容相似，优先融合整理。",
         ),
     ] = None,
     analysis: Annotated[
         str | None,
         Field(
             default=None,
-            description="project_record 必填，其他类型可选。用于保存原因判断、方案分析、排查结论，以及为什么这样判断、为什么这么做；要留下后续可复用的思路。",
+            description="project_record 必填，其他类型可选。用于保存已证实的原因判断、取舍依据和排查结论，以及为什么这样判断、为什么这么做；要留下后续可复用的思路。这里只允许写入已验证事实、用户明确实践过的操作，或能被文件、截图、日志、命令输出直接证明的结论，不要写怀疑方向、猜测性归因或未证实判断。",
         ),
     ] = None,
     action_steps: Annotated[
         str | None,
         Field(
             default=None,
-            description="project_record 必填，其他类型可选。用于保存真正解决问题时执行的关键步骤、命令、操作顺序或具体处理动作，不要堆无用流水过程。",
+            description="project_record 必填，其他类型可选。用于保存真正解决问题时执行的关键步骤、命令、操作顺序或具体处理动作，不要堆无用流水过程。只写用户明确实践过的操作，或有文件、截图、日志、命令输出可直接证明的动作和结果；不要补写未经实践的建议性步骤。",
         ),
     ] = None,
     validation_result: Annotated[
         str | None,
         Field(
             default=None,
-            description="project_record 必填，其他类型可选。用于保存测试、验证、复现是否消失、验收结果等验证结论；默认应记录已经解决并验证过的问题。",
+            description="project_record 必填，其他类型可选。用于保存测试、验证、复现是否消失、验收结果等验证结论；默认应记录已经解决并验证过的问题。这里只写已验证结果或能被文件、截图、日志、命令输出直接证明的结论；不要补写未经验证的判断。",
         ),
     ] = None,
     tags: Annotated[
@@ -656,12 +658,91 @@ def save(
     )
 
 
+# 对外暴露 save_chatEvent 工具，固定把当前写入保存成新的 chat_event 事件记忆。
+@server.tool(
+    name="save_chatEvent",
+    description=(
+        "专门用于保存一条会话事件记忆。"
+        "这个接口固定把 memory_kind 设为 chat_event。"
+        "chat_event 默认按新事件存储，不因为主题相近、人物相近或问题相近，就默认更新旧 chat_event。"
+        "只有在补充刚写入不久的同一事件，或纠正原记录事实错误时，才应优先考虑 update 旧 chat_event。"
+        "正式入库内容只应包含已验证的事实、用户明确实践过的操作，或能被文件、截图、日志、命令输出直接证明的结论；不要把未验证的推测、归因或建议写成正式记忆。"
+        "如果与已有已验证内容完全一致，仍会按现有 save_record 规则去重。"
+    ),
+)
+def save_chatEvent(
+    title: Annotated[
+        str,
+        Field(description="必填。事件标题，用一句话概括这次会话事件。只写已验证事实、用户明确实践过的操作，或有直接证据支撑的结论；不要补写未经验证的推测、归因或建议。"),
+    ],
+    short_summary: Annotated[
+        str,
+        Field(
+            description=(
+                "必填。用于嵌入检索的简短摘要，建议控制在一两句话内。"
+                "这个字段需要 AI 主动总结，会放在 retrieval_fields 的第二位。"
+                "内容只应来自已验证事实、用户明确实践过的操作，或有直接证据支撑的结论；如果与已有已验证内容相似，优先融合整理，不要重复新编近似说法。"
+            ),
+        ),
+    ],
+    detailed_summary: Annotated[
+        str,
+        Field(
+            description=(
+                "必填。AI 整理后的最终详细总结，也是正式入库字段。"
+                "如果用户指定了参考文档，这里的信息不能比参考文档更少。"
+                "只允许写入已验证事实、用户明确实践过的操作，或能被文件、截图、日志、命令输出直接证明的结论，不得补写未经验证的推测、归因或建议。"
+            )
+        ),
+    ],
+    tags: Annotated[
+        TagListInput,
+        Field(
+            default=None,
+            description=(
+                "最终存储必有。推荐由 AI 传入标签数组；如果缺失，服务端会做基础兜底补全。"
+            ),
+            json_schema_extra={"examples": [["chat_event", "memory-rag-mcp", "会话记录"]]},
+        ),
+    ] = None,
+    source_paths: Annotated[
+        SourcePathListInput,
+        Field(
+            default=None,
+            description="可选。普通来源材料路径或链接列表，例如日志、网页、截图来源。",
+            json_schema_extra={"examples": [["C:\\Users\\ndir\\notes\\chat-log.md"]]},
+        ),
+    ] = None,
+    reference_doc_path: Annotated[
+        str | None,
+        Field(
+            default=None,
+            description=(
+                "可选。参考文档路径。仅当用户指定了现成文档让 AI 归档时填写，"
+                "不与 source_paths 混用。"
+            ),
+        ),
+    ] = None,
+) -> dict[str, Any]:
+    return save_record(
+        memory_kind="chat_event",
+        title=title,
+        detailed_summary=detailed_summary,
+        short_summary=short_summary,
+        tags=tags,
+        source_paths=source_paths,
+        reference_doc_path=reference_doc_path,
+    )
+
+
 # 对外暴露 update 工具，用于按 id 更新一条已有记忆并重建索引。
 @server.tool(
     name="update",
     description=(
         "按 id 更新一条已有记忆。"
         "changes 是补丁对象，传什么字段就改什么字段；如果规范化后内容未变化，则返回 updated=false 且不重建。"
+        "changes 中新增或替换的内容，只应包含已验证的事实、用户明确实践过的操作，或能被文件、截图、日志、命令输出直接证明的结论；不要把未验证的推测、归因或建议补进已有记录。"
+        "如果只是补充已有相似且已验证的内容，优先融合到原记录，而不是制造重复表达。"
     ),
 )
 def update(
@@ -674,9 +755,13 @@ def update(
         Field(
             description=(
                 "必填。要修改的字段键值对对象，只传要改的业务字段。"
-                "允许字段包括 memory_kind、title、short_summary、detailed_summary、"
+                "允许字段包括 title、short_summary、detailed_summary、"
                 "problem_background、analysis、action_steps、validation_result、"
                 "tags、source_paths、reference_doc_path。"
+                "传入的业务字段值只应包含已验证事实、用户明确实践过的操作，或能被文件、截图、日志、命令输出直接证明的结论；"
+                "不要把未验证的推测、归因或建议写成更新内容。"
+                "记忆类型切换不再由 update 完成；如果要把 chat_event 调整成 project_record，应由调用方重新提炼内容后调用 save 新存，必要时再 delete 原记录。"
+                "如果与原记录或其他已有记录中的已验证内容相似，优先融合整理，不要重复补一条近似说法。"
             ),
             json_schema_extra={"examples": [{"title": "更新后的标题", "analysis": "补充后的分析"}]},
         ),
