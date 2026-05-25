@@ -21,9 +21,8 @@ CURRENT_DIR = Path(__file__).resolve().parent
 if str(CURRENT_DIR) not in sys.path:
     sys.path.insert(0, str(CURRENT_DIR))
 
-# 导入底层函数
+# 导入 server_utils 中的底层函数
 from server_utils import (
-    DEBUG_RESULT_FIELDS,
     DETAIL_RESULT_FIELDS,
     INDEX_PATH,
     MATCHED_FIELDS_LIMIT,
@@ -35,15 +34,16 @@ from server_utils import (
     SourcePathListInput,
     TagListInput,
     build_fact_extraction_reminder,
-    build_model_fingerprint,
+    build_embedding_model_fingerprint,
     build_payload,
+    build_project_id,
     build_update_candidate_record,
     count_public_store_entries,
     encode_texts,
     ensure_write_operations_allowed,
     fetch_entry_family_by_source_ids,
-    fetch_public_entry_by_fingerprint,
     fetch_public_timeline_summary_entries,
+    fetch_project_registry_entry_by_title,
     fetch_store_entries_by_ids,
     fetch_store_entry_by_id,
     get_embedder,
@@ -51,13 +51,14 @@ from server_utils import (
     load_rebuild_state,
     normalize_record_ids,
     now_iso,
-    payload_fingerprint,
-    payload_id,
+    project_registry_has_project_records,
+    generate_memory_id,
     resolve_embed_device,
     resolve_embed_model_path,
     RETRIEVAL_FIELD_SIGNATURE,
     update_store_and_rebuild,
     validate_update_changes,
+    validate_update_changes_for_entry,
 )
 
 
@@ -72,7 +73,7 @@ server = FastMCP(
 
 # 按多条记录 id 回源主数据并返回完整详情记忆；保留在本文件是为了让“接口 -> 主数据回源 -> 结果裁剪”的链路仍能在入口层直接看清。
 # 这里直接按 id 查 SQLite 主数据，不碰 meta。
-def get_detail_records_by_ids(record_ids: list[str], include_debug: bool = False) -> dict[str, Any]:
+def get_detail_records_by_ids(record_ids: list[str]) -> dict[str, Any]:
     normalized_ids = normalize_record_ids(record_ids)
     fetched_entries = fetch_store_entries_by_ids(normalized_ids)
     store_entry_map = {
@@ -94,13 +95,6 @@ def get_detail_records_by_ids(record_ids: list[str], include_debug: bool = False
             field_name: source_entry.get(field_name)
             for field_name in DETAIL_RESULT_FIELDS
         }
-        if include_debug:
-            result.update(
-                {
-                    field_name: source_entry.get(field_name)
-                    for field_name in DEBUG_RESULT_FIELDS
-                }
-            )
         records.append(result)
 
     return {
@@ -133,6 +127,13 @@ def delete_records_by_ids(
             continue
         if is_field_record_entry(source_entry):
             raise ValueError(f"field_record is an internal index asset and cannot be deleted directly: {normalized_record_id}")
+        if (
+            str(source_entry.get("memory_kind") or "").strip() == "project_registry"
+            and project_registry_has_project_records(normalized_record_id)
+        ):
+            raise ValueError(
+                f"project_registry still has project_records attached and cannot be deleted: {normalized_record_id}"
+            )
         deleted_ids.append(normalized_record_id)
 
     if not deleted_ids:
@@ -192,8 +193,8 @@ def search_records(
         raise RuntimeError("Vector index file does not exist yet. Save at least one record first.")
     index = faiss.read_index(str(INDEX_PATH))
     resolved_model_path = model_path or resolve_embed_model_path()
-    current_model_fingerprint = build_model_fingerprint(resolved_model_path)
-    if str(meta.get("model_fingerprint") or "").strip() != current_model_fingerprint:
+    current_embedding_model_fingerprint = build_embedding_model_fingerprint(resolved_model_path)
+    if str(meta.get("embedding_model_fingerprint") or "").strip() != current_embedding_model_fingerprint:
         raise RuntimeError(
             "Vector index was built with a different embedding model. Rebuild the index before searching."
         )
@@ -318,20 +319,22 @@ def search_records(
 
 
 # 保存一条结构化记忆；
-# 新增时增量编码新记录，
-# 如果 fingerprint 重复命中则直接返回现有旧记录；
+# 新增时增量编码新记录，并同步更新时间线与向量索引。
 def save_record(
-    memory_kind: MemoryKind,
+    memory_kind: str,
     title: str,
     detailed_summary: str,
     short_summary: str,
+    overview_summary: str | None = None,
     problem_background: str | None = None,
     analysis: str | None = None,
     action_steps: str | None = None,
     validation_result: str | None = None,
+    project_id: str | None = None,
     tags: list[str] | str | None = None,
     source_paths: list[str] | str | None = None,
     reference_doc_path: str | None = None,
+    record_id_override: str | None = None,
     embedder: Any | None = None,
     model_path: str | None = None,
 ) -> dict[str, Any]:
@@ -341,53 +344,28 @@ def save_record(
         title=title,
         detailed_summary=detailed_summary,
         short_summary=short_summary,
+        overview_summary=overview_summary,
         problem_background=problem_background,
         analysis=analysis,
         action_steps=action_steps,
         validation_result=validation_result,
+        project_id=project_id,
         tags=tags,
         source_paths=source_paths,
         reference_doc_path=reference_doc_path,
     )
-    fingerprint = payload_fingerprint(payload)
-    entry_id = payload_id(fingerprint)
-    existing = fetch_public_entry_by_fingerprint(fingerprint)
+    entry_id = str(record_id_override or "").strip() or generate_memory_id(memory_kind)
 
     resolved_model_path = model_path or resolve_embed_model_path()
 
-    deduped = existing is not None
-    if deduped:
-        current_index_stats = {"count": count_public_store_entries(), "dim": 0}
-        if META_PATH.exists():
-            try:
-                with META_PATH.open("r", encoding="utf-8") as handle:
-                    current_meta = json.load(handle)
-                if isinstance(current_meta, dict):
-                    current_index_stats["dim"] = int(current_meta.get("dim") or 0)
-            except (OSError, json.JSONDecodeError, ValueError):
-                current_index_stats["dim"] = 0
-        timeline_entries = fetch_public_timeline_summary_entries(limit=3)
-        timeline_summary = [f"{entry['updated_at']} | {entry['title']}" for entry in timeline_entries]
-        return {
-            "id": existing["id"],
-            "updated_at": existing["updated_at"],
-            "created_at": existing["created_at"],
-            "tags": existing["tags"],
-            "deduped": True,
-            "total_entries": count_public_store_entries(),
-            "timeline_summary": timeline_summary,
-            "index_stats": current_index_stats,
-        }
-    else:
-        created_now = now_iso()
-        # 先在内存里组装“准备入库的新记录”
-        saved_entry = {  # 这是一条新记录的完整主数据对象
-            "id": entry_id,
-            "fingerprint": fingerprint,
-            "created_at": created_now,
-            "updated_at": created_now,
-            **payload,
-        }
+    created_now = now_iso()
+    # 先在内存里组装“准备入库的新记录”
+    saved_entry = {  # 这是一条新记录的完整主数据对象
+        "id": entry_id,
+        "created_at": created_now,
+        "updated_at": created_now,
+        **payload,
+    }
 
     rebuild_result = update_store_and_rebuild(
         embedder=embedder,
@@ -406,11 +384,12 @@ def save_record(
         "updated_at": normalized_saved_entry["updated_at"],
         "created_at": normalized_saved_entry["created_at"],
         "tags": normalized_saved_entry["tags"],
-        "deduped": deduped,
         "total_entries": rebuild_result["total_entries"],
         "timeline_summary": rebuild_result["timeline_summary"],
         "index_stats": rebuild_result["index_stats"],
     }
+    if str(normalized_saved_entry.get("project_id") or "").strip():
+        result["project_id"] = str(normalized_saved_entry.get("project_id") or "").strip()
     if "index_refresh_state" in rebuild_result:
         result["index_refresh_state"] = rebuild_result["index_refresh_state"]
         result["index_refresh_mode"] = rebuild_result["index_refresh_mode"]
@@ -445,47 +424,11 @@ def update_record(
         raise ValueError(f"record not found: {normalized_record_id}")
     if is_field_record_entry(source_entry):
         raise ValueError(f"field_record is an internal index asset and cannot be updated directly: {normalized_record_id}")
+    normalized_changes = validate_update_changes_for_entry(source_entry, normalized_changes)
 
     # 第三块：基于“旧记录 + 补丁”合成候选新记录。
-    # 这里会重新走底层 payload 规范化和 fingerprint 计算，所以后面可以直接判断：
-    # 这次到底是 no-op，还是一次真实内容变更。
+    # 这里会重新走底层 payload 规范化，保证 update 和 save 共用同一套字段收口规则。
     candidate_entry = build_update_candidate_record(source_entry, normalized_changes)
-
-    # 第四块：如果规范化后的候选记录和当前记录 fingerprint 一样，说明这次 update 没有带来真实内容变化。
-    # 这种场景直接返回 updated=false，不刷新 updated_at，也不触发任何索引重建。
-    if candidate_entry["fingerprint"] == source_entry.get("fingerprint"):
-        current_index_stats = {"count": count_public_store_entries(), "dim": 0}
-        if META_PATH.exists():
-            try:
-                with META_PATH.open("r", encoding="utf-8") as handle:
-                    current_meta = json.load(handle)
-                if isinstance(current_meta, dict):
-                    current_index_stats["dim"] = int(current_meta.get("dim") or 0)
-            except (OSError, json.JSONDecodeError, ValueError):
-                current_index_stats["dim"] = 0
-        timeline_entries = fetch_public_timeline_summary_entries(limit=3)
-        timeline_summary = [f"{entry['updated_at']} | {entry['title']}" for entry in timeline_entries]
-        return {
-            "id": source_entry["id"],
-            "updated_at": source_entry["updated_at"],
-            "created_at": source_entry["created_at"],
-            "tags": source_entry["tags"],
-            "updated": False,
-            "total_entries": count_public_store_entries(),
-            "timeline_summary": timeline_summary,
-            "index_stats": current_index_stats,
-        }
-
-    # 第五块：检查“更新后的内容是否和另一条主记忆完全撞车”。
-    # 如果新 fingerprint 已经属于别的主记忆，就直接报冲突；旧记录保持不动，不做隐式合并。
-    conflicting_entry = fetch_public_entry_by_fingerprint(
-        candidate_entry["fingerprint"],
-        exclude_id=normalized_record_id,
-    )
-    if conflicting_entry is not None:
-        raise ValueError(
-            f"update conflict: updated content matches existing record {conflicting_entry['id']}"
-        )
 
     # 第六块：在内存里构造更新后的最终记录，并把旧主数据列表中的这一条替换掉。
     # 这里保留原 id 和 created_at，只刷新 updated_at；语义仍然是“更新旧记录”，不是“删掉再新建一条”。
@@ -522,6 +465,8 @@ def update_record(
         "timeline_summary": rebuild_result["timeline_summary"],
         "index_stats": rebuild_result["index_stats"],
     }
+    if str(normalized_updated_entry.get("project_id") or "").strip():
+        result["project_id"] = str(normalized_updated_entry.get("project_id") or "").strip()
     if "index_refresh_state" in rebuild_result:
         result["index_refresh_state"] = rebuild_result["index_refresh_state"]
         result["index_refresh_mode"] = rebuild_result["index_refresh_mode"]
@@ -534,34 +479,97 @@ def update_record(
     return result
 
 
-# 对外暴露 save 工具，用于保存高信息密度记忆并重建索引。
+# 显式创建一条 project_registry 项目摘要；这里先挡住同名项目，再把项目摘要作为新的可检索主记忆写入统一索引。
+def create_project_record(
+    title: str,
+    overview_summary: str,
+    tags: list[str] | str | None = None,
+    source_paths: list[str] | str | None = None,
+    reference_doc_path: str | None = None,
+    embedder: Any | None = None,
+    model_path: str | None = None,
+) -> dict[str, Any]:
+    existing_project = fetch_project_registry_entry_by_title(title)
+    if existing_project is not None:
+        raise ValueError(
+            f"project title already exists: {existing_project['title']} ({existing_project['id']})"
+        )
+    generated_project_id = build_project_id()
+    result = save_record(
+        memory_kind="project_registry",
+        title=title,
+        detailed_summary="",
+        short_summary="",
+        overview_summary=overview_summary,
+        project_id=generated_project_id,
+        tags=tags,
+        source_paths=source_paths,
+        reference_doc_path=reference_doc_path,
+        record_id_override=generated_project_id,
+        embedder=embedder,
+        model_path=model_path,
+    )
+    result["project_id"] = generated_project_id
+    return result
+
+
+# 向一个已存在 project_id 下面追加一条共享 project_record；这里先校验项目是否存在，再复用现有 save 增量刷新路径。
+def save_project_record(
+    project_id: str,
+    title: str,
+    short_summary: str,
+    detailed_summary: str,
+    problem_background: str,
+    analysis: str,
+    action_steps: str,
+    validation_result: str,
+    tags: list[str] | str | None = None,
+    source_paths: list[str] | str | None = None,
+    reference_doc_path: str | None = None,
+    embedder: Any | None = None,
+    model_path: str | None = None,
+) -> dict[str, Any]:
+    normalized_project_id = str(project_id or "").strip()
+    if not normalized_project_id:
+        raise ValueError("project_id is required")
+    project_entry = fetch_store_entry_by_id(normalized_project_id)
+    if project_entry is None or str(project_entry.get("memory_kind") or "").strip() != "project_registry":
+        raise ValueError(f"project_id does not exist: {normalized_project_id}")
+    result = save_record(
+        memory_kind="project_record",
+        title=title,
+        detailed_summary=detailed_summary,
+        short_summary=short_summary,
+        problem_background=problem_background,
+        analysis=analysis,
+        action_steps=action_steps,
+        validation_result=validation_result,
+        project_id=normalized_project_id,
+        tags=tags,
+        source_paths=source_paths,
+        reference_doc_path=reference_doc_path,
+        embedder=embedder,
+        model_path=model_path,
+    )
+    result["project_id"] = normalized_project_id
+    return result
+
+
+# 对外暴露 save_fact 工具，专门用于保存长期 fact 事实记忆。
 @server.tool(
-    name="save",
+    name="save_fact",
     description=(
-        "保存一条高信息密度的项目经验、会话事件或事实记忆，更新最近更新时间线，并重建 RAG 向量索引。"
+        "保存一条长期 fact 记忆，用于记录跨会话稳定的个人长期事实、偏好、约束或目标，更新最近更新时间线，并重建 RAG 向量索引。"
         "AI 在调用前应先整理内容；如用户指定了参考文档，AI 应先阅读文档，再提取并补充结构化字段。"
-        "正式入库内容只应包含已验证的事实、用户明确实践过的操作，或能被文件、截图、日志、命令输出直接证明的结论；不要把未验证的推测、归因或建议写成正式记忆。"
-        "如果与已有已验证记忆相似，优先先 search 并融合到已有记录或本次更新里，不要重复堆新的近似表述。"
-        "推荐流程：1. 如果本次要存的是非事件记忆，先 search 看看是否已有与当前主题相近的记忆。"
-        "2. 如果已存在相近记忆，优先判断是否应该对已有记忆执行 update。"
-        "3. 如果不存在合适的已有记忆，再调用 save 新建一条记忆。"
-        "4. 每次 save 或 update 之后，再判断这条记忆里是否真的包含长期可复用、跨会话稳定、对长期陪伴有帮助的事实；只有确实存在这类事实时，才考虑继续按 fact 流程处理：先 search 相近 fact，若已有语义相近 fact 则优先 update，若没有相近 fact 则再 save 新 fact。"
-        "如果内容主要是项目问题的排查、调试和解决过程，而 project_record 已经完整记录，则通常不需要再额外提取 fact。"
-        "这里说的是推荐使用策略，不是服务端自动执行逻辑。"
+        "正式入库内容只应包含已验证的事实、用户明确实践过的操作，或能被文件、截图、日志、命令输出直接证明的结论；不要把未验证的推测、归因或建议写成正式事实记忆。"
+        "如果与已有已验证事实相似，优先先 search 并融合到已有记录或本次更新里，不要重复堆新的近似表述。"
+        "推荐流程：1. 先 search 看看是否已有与当前主题相近的 fact 记忆。"
+        "2. 如果已存在相近 fact，优先判断是否应该对已有记忆执行 update。"
+        "3. 如果不存在合适 fact，再调用 save_fact 新建一条事实记忆。"
+        "请注意，只有真正稳定、可跨会话复用的规则和个人事实才值得存为 fact；不要把项目问题排查记录或一次性事件存成 fact，它们有专属的 project_record 和 chat_event 接口。"
     ),
 )
-def save(
-    memory_kind: Annotated[
-        MemoryKind,
-        Field(
-            description=(
-                "必填。记忆类型，只能是 project_record、chat_event 或 fact。"
-                "chat_event 一般没有特殊说明时就作为一般事件类型存储。"
-                "fact 表示稳定事实记忆，以个人长期事实为主，更适合保存个人信息、长期偏好、稳定约束、长期状态、最近目标、已确认关系共识这类跨会话可复用事实。"
-                "不建议把 project_record 里已经完整记录的项目 debug 过程、排错流水和解决链路再重复存成 fact；只有当项目内容被提炼成真正稳定、可跨会话复用的规则时，才考虑转成 fact。"
-            )
-        ),
-    ],
+def save_fact(
     title: Annotated[
         str,
         Field(description="必填。记录标题，用一句话概括本次记忆。只写已验证事实、用户明确实践过的操作，或有直接证据支撑的结论；不要补写未经验证的推测、归因或建议。"),
@@ -644,7 +652,7 @@ def save(
     ] = None,
 ) -> dict[str, Any]:
     return save_record(
-        memory_kind=memory_kind,
+        memory_kind="fact",
         title=title,
         detailed_summary=detailed_summary,
         short_summary=short_summary,
@@ -667,7 +675,6 @@ def save(
         "chat_event 默认按新事件存储，不因为主题相近、人物相近或问题相近，就默认更新旧 chat_event。"
         "只有在补充刚写入不久的同一事件，或纠正原记录事实错误时，才应优先考虑 update 旧 chat_event。"
         "正式入库内容只应包含已验证的事实、用户明确实践过的操作，或能被文件、截图、日志、命令输出直接证明的结论；不要把未验证的推测、归因或建议写成正式记忆。"
-        "如果与已有已验证内容完全一致，仍会按现有 save_record 规则去重。"
     ),
 )
 def save_chatEvent(
@@ -735,12 +742,163 @@ def save_chatEvent(
     )
 
 
+# 对外暴露 create_project 工具，固定创建一条 project_registry 项目摘要记忆。
+@server.tool(
+    name="create_project",
+    description=(
+        "显式创建一条新的项目摘要记忆。"
+        "这个接口固定把记录类型写成 project_registry，并自动生成 project_id。"
+        "project_id 只用于聚合同项目的具体问题记录和项目摘要，不参与 embedding 文本。"
+        "项目摘要会进入向量库，也会生成自己的 field_record。"
+        "正式入库内容只应包含已验证的事实、用户明确实践过的操作，或能被文件、截图、日志、命令输出直接证明的结论；不要把未验证的推测、归因或建议写成正式记忆。"
+    ),
+)
+def create_project(
+    title: Annotated[
+        str,
+        Field(description="必填。项目名称，用一句话概括项目本身。标题会作为项目摘要检索文本的一部分。"),
+    ],
+    overview_summary: Annotated[
+        str,
+        Field(
+            description=(
+                "必填。项目整体概述。"
+                "它是 project_registry 的核心正文，会参与项目摘要的 embedding 和 field_record 生成。"
+                "这里只允许写入已验证事实、用户明确实践过的操作，或有直接证据支撑的结论。"
+            ),
+        ),
+    ],
+    tags: Annotated[
+        TagListInput,
+        Field(
+            default=None,
+            description="可选。项目标签数组，会和 title、overview_summary 一起参与检索文本拼接。",
+            json_schema_extra={"examples": [["memory-rag-mcp", "SQLite", "项目升级"]]},
+        ),
+    ] = None,
+    source_paths: Annotated[
+        SourcePathListInput,
+        Field(
+            default=None,
+            description="可选。普通来源材料路径或链接列表，例如设计说明、任务文档、日志来源。",
+            json_schema_extra={"examples": [["C:\\Users\\ndir\\docs\\project-brief.md"]]},
+        ),
+    ] = None,
+    reference_doc_path: Annotated[
+        str | None,
+        Field(
+            default=None,
+            description="可选。参考文档路径。仅当用户明确指定了参考文档让 AI 归档时填写，不与 source_paths 混用。",
+        ),
+    ] = None,
+) -> dict[str, Any]:
+    return create_project_record(
+        title=title,
+        overview_summary=overview_summary,
+        tags=tags,
+        source_paths=source_paths,
+        reference_doc_path=reference_doc_path,
+    )
+
+
+# 对外暴露 save_project 工具，固定把问题记录挂到一个已存在的 project_id 下面。
+@server.tool(
+    name="save_project",
+    description=(
+        "向一个已存在 project_id 的项目下保存一条新的 project_record。"
+        "这个接口不会隐式创建项目；调用方必须先 create_project，再拿返回的 project_id 继续写项目问题。"
+        "project_id 只负责把同项目的具体问题记录聚到一起，不参与 embedding 文本。"
+        "正式入库内容只应包含已验证的事实、用户明确实践过的操作，或能被文件、截图、日志、命令输出直接证明的结论；不要把未验证的推测、归因或建议写成正式记忆。"
+    ),
+)
+def save_project(
+    project_id: Annotated[
+        str,
+        Field(description="必填。已存在的 project_id；只有 project_registry 里存在的 id 才允许挂接项目问题。"),
+    ],
+    title: Annotated[
+        str,
+        Field(description="必填。问题记录标题，用一句话概括这次项目问题或子主题。"),
+    ],
+    short_summary: Annotated[
+        str,
+        Field(
+            description=(
+                "必填。用于嵌入检索的简短摘要，建议控制在一两句话内。"
+                "内容只应来自已验证事实、用户明确实践过的操作，或有直接证据支撑的结论。"
+            ),
+        ),
+    ],
+    detailed_summary: Annotated[
+        str,
+        Field(
+            description=(
+                "必填。AI 整理后的正式详细总结。"
+                "只允许写入已验证事实、用户明确实践过的操作，或能被文件、截图、日志、命令输出直接证明的结论。"
+            ),
+        ),
+    ],
+    problem_background: Annotated[
+        str,
+        Field(description="必填。问题背景、故障现象，以及这条项目问题为什么值得记录。"),
+    ],
+    analysis: Annotated[
+        str,
+        Field(description="必填。已证实的原因判断、取舍依据和排查结论；不要写怀疑方向或未证实归因。"),
+    ],
+    action_steps: Annotated[
+        str,
+        Field(description="必填。真正执行过的关键步骤、命令和操作顺序；不要补写未经实践的建议。"),
+    ],
+    validation_result: Annotated[
+        str,
+        Field(description="必填。测试、验证、复现是否消失或验收结果等已证实结论。"),
+    ],
+    tags: Annotated[
+        TagListInput,
+        Field(
+            default=None,
+            description="可选。项目问题标签数组；缺失时服务端会做基础兜底补全。",
+            json_schema_extra={"examples": [["SQLite", "schema", "memory-rag-mcp"]]},
+        ),
+    ] = None,
+    source_paths: Annotated[
+        SourcePathListInput,
+        Field(
+            default=None,
+            description="可选。普通来源材料路径或链接列表，例如日志、网页、截图来源。",
+            json_schema_extra={"examples": [["C:\\Users\\ndir\\logs\\issue.log"]]},
+        ),
+    ] = None,
+    reference_doc_path: Annotated[
+        str | None,
+        Field(
+            default=None,
+            description="可选。参考文档路径。仅当用户明确指定了参考文档让 AI 归档时填写，不与 source_paths 混用。",
+        ),
+    ] = None,
+) -> dict[str, Any]:
+    return save_project_record(
+        project_id=project_id,
+        title=title,
+        short_summary=short_summary,
+        detailed_summary=detailed_summary,
+        problem_background=problem_background,
+        analysis=analysis,
+        action_steps=action_steps,
+        validation_result=validation_result,
+        tags=tags,
+        source_paths=source_paths,
+        reference_doc_path=reference_doc_path,
+    )
+
+
 # 对外暴露 update 工具，用于按 id 更新一条已有记忆并重建索引。
 @server.tool(
     name="update",
     description=(
         "按 id 更新一条已有记忆。"
-        "changes 是补丁对象，传什么字段就改什么字段；如果规范化后内容未变化，则返回 updated=false 且不重建。"
+        "changes 是补丁对象，传什么字段就改什么字段；通过校验后会按当前类型写回主数据并刷新受影响索引。"
         "changes 中新增或替换的内容，只应包含已验证的事实、用户明确实践过的操作，或能被文件、截图、日志、命令输出直接证明的结论；不要把未验证的推测、归因或建议补进已有记录。"
         "如果只是补充已有相似且已验证的内容，优先融合到原记录，而不是制造重复表达。"
     ),
@@ -755,11 +913,12 @@ def update(
         Field(
             description=(
                 "必填。要修改的字段键值对对象，只传要改的业务字段。"
-                "允许字段包括 title、short_summary、detailed_summary、"
+                "允许字段包括 title、short_summary、overview_summary、detailed_summary、"
                 "problem_background、analysis、action_steps、validation_result、"
                 "tags、source_paths、reference_doc_path。"
                 "传入的业务字段值只应包含已验证事实、用户明确实践过的操作，或能被文件、截图、日志、命令输出直接证明的结论；"
                 "不要把未验证的推测、归因或建议写成更新内容。"
+                "project_id 不允许通过 update 修改。"
                 "记忆类型切换不再由 update 完成；如果要把 chat_event 调整成 project_record，应由调用方重新提炼内容后调用 save 新存，必要时再 delete 原记录。"
                 "如果与原记录或其他已有记录中的已验证内容相似，优先融合整理，不要重复补一条近似说法。"
             ),
@@ -774,7 +933,7 @@ def update(
 @server.tool(
     name="search",
     description=(
-        "按向量相似度检索已保存的项目经验、会话事件和事实记忆，返回最相关的 top-k 条轻量候选记录。"
+        "按向量相似度检索已保存的项目经验、项目摘要、会话事件和事实记忆，返回最相关的 top-k 条轻量候选记录。"
         "如果需要完整详情，请使用 get_details_by_ids。"
     ),
 )
@@ -827,7 +986,6 @@ def search(
     description=(
         "按记录 ids 读取一批项目经验、会话事件或事实记忆的完整详情。"
         "如果部分 id 不存在，会在 missing_ids 中显式返回。"
-        "如需查看内部调试字段，可显式传入 include_debug=true。"
     ),
 )
 def get_details_by_ids(
@@ -838,18 +996,8 @@ def get_details_by_ids(
             json_schema_extra={"examples": [["pmem-123456789abc", "pmem-abcdef123456"]]},
         ),
     ],
-    include_debug: Annotated[
-        bool,
-        Field(
-            default=False,
-            description=(
-                "可选。是否返回内部调试字段。"
-                "开启后会额外返回 fingerprint 和 retrieval_fields。"
-            ),
-        ),
-    ] = False,
 ) -> dict[str, Any]:
-    return get_detail_records_by_ids(record_ids=ids, include_debug=include_debug)
+    return get_detail_records_by_ids(record_ids=ids)
 
 
 # 对外暴露 delete_by_ids 工具，用于从主数据中硬删除多条记录并重建库。

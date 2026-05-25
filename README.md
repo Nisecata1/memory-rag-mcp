@@ -11,11 +11,13 @@
 ## 项目特点
 ![memory-rag-mcp overview](assets/readme-overview.png)
 **SQLite 作为主数据来源接入**
-当前主数据事实源已经收口到 `SQLite`。这里具体指：`save / update / delete / get_details / timeline` 这几条链路不再依赖把整库 JSON 读进内存，而是直接按 `id`、`source_memory_id` 和稳定排序去查 `memory.db`。当前 `memory.db` 内部已经改成分表结构：轻总表 `memory_registry`、三张类型详情表和一张 `field_records` 表，不再是早期单表 `memory_entries`。
-向量侧仍然保留 `memory_embeddings.npy`、`memory.faiss` 和 `meta_NpyRow-to-id.json`。新增、更新、删除时，主数据先按行写入 `SQLite`，再尽量复用旧向量缓存做增量刷新；只有缓存不再安全可复用时，才退回后台全量重建。
+当前几种类型的记忆使用 `SQLite` 分表存储。
+`save / update / delete / get_details / timeline` 这几条接口链路不再依赖把整库 JSON 读进内存，而是按 `id`、`source_memory_id` 和稳定排序去查 `memory.db`。
+当前 `memory.db` 内部已经改成分表结构：轻总表 `memory_registry`(存放各个记忆类型分表的公开信息字段作为分表索引)、三张类型详情表和一张 `field_records` 表，不再是早期单表 `memory_entries`。
+ rag （向量检索）侧仍然保留 `memory_embeddings.npy`、`memory.faiss` 和 `meta_NpyRow-to-id.json`。新增、更新、删除时，主数据先按行写入 `SQLite`，再尽量复用旧向量缓存做增量刷新；只有缓存不再安全可复用时，才退回后台全量重建。
 
 **多种记忆类型**
-使用方面，不只存一种记忆，而是明确分成 project_record、chat_event、fact 三种公共记忆类型，分别对应项目问题沉淀、普通会话事件、自动提取的长期事实。
+使用方面，不只存一种记忆，而是根据个人实际使用情况不断长期测试，明确分成 project_record、chat_event、fact 三种公共记忆类型，分别对应项目归档、普通会话事件（侧重时间切片）、自动提取的长期事实。
 
 **field_record 内部记忆类型**
 该记忆类型不作为返回，仅为了提升召回，在 save 时由服务端自动拆分记忆的每个字段分别存储一遍，并且 search 调用时不会返回给用户
@@ -26,6 +28,22 @@
 在性能上重点做了“少重复 embedding”。这里具体指：优先走本地 embedding 缓存和增量更新，只有缓存失效或条件不满足时才退回后台全量重建。
 
 它的运行参数不是散在环境变量里，而是统一收口在 config/settings.yaml。这里具体指：server、paths、embedding、memory、summary、search、retrieval、results 都在一份 YAML 里管理。
+
+**项目归档分表优化**（建设中
+project 分为项目索引表和项目child表，实现了同项目下一个问题归档为一条记录，避免了一个项目一个表项条目所导致的token爆炸和总结质量低下的问题
+
+**检索文本(记忆中真正向量化的字段)**
+对应字段：retrieval_fields_json
+retrieval_fields_json 保留，但它仍然只是内部字段名单，不是新的业务信息。
+这里具体指：它记录“这条记录哪些字段要拼进 embedding 文本”, 供 build_retrieval_text(...) 使用。
+project_registry 真正参与检索文本的字段固定为：
+- title
+- overview_summary
+- tags
+project_id 不进检索文本。
+created_at、updated_at、reference_doc_path、source_paths 不进检索文本，避免时间和路径噪声污染召回。
+project_registry 不再要求调用方传 short_summary；如果统一返回结构仍需要 short_summary，就在服务端基于 overview_summary 自动生成一个兼容值，不单独落库。
+(待优化，返回结构不应该由接口限制，毕竟记忆的字段都已经是服务端定好的，遵循严入宽出的原则)
 
 
 
@@ -138,16 +156,16 @@
   - 副作用：更新 `SQLite` 主数据、重写时间线 Markdown，并优先复用本地 embedding 缓存来刷新向量索引。
 - `save_chatEvent`
   - 作用：专门保存一条 `chat_event` 会话事件记忆。
-  - 返回方式：固定按 `chat_event` 新事件写入，返回字段与现有 `save` 一致；只有完全重复时才按现有去重规则复用旧记录。
+  - 返回方式：固定按 `chat_event` 新事件写入，返回字段与现有 `save` 一致，不自动回写旧事件。
 - `update`
   - 作用：按 `id` 更新一条已有记忆。
-  - 返回方式：补丁式修改原类型下的主数据字段；如果规范化后内容未变化，返回 `updated=false` 且不重建。当前不再用 `update` 做记忆类型切换。
+  - 返回方式：补丁式修改原类型下的主数据字段；通过校验后写回主数据，并刷新受影响索引。当前不再用 `update` 做记忆类型切换。
 - `search`
   - 作用：按向量相似度检索最相关的历史记忆候选。
   - 返回方式：先查 `FAISS`，再按命中 id 回源 `SQLite` 主数据，只返回轻量候选字段和相似度分数；如果命中的是内部字段级子记忆，会先折叠回源到主记忆。
 - `get_details_by_ids`
   - 作用：按一批记录 `ids` 读取完整详情。
-  - 返回方式：直接按 `id` 回源 `SQLite` 主数据，统一返回 `records` 列表和 `missing_ids`；仅在显式调试模式下附带内部调试字段。
+  - 返回方式：直接按 `id` 回源 `SQLite` 主数据，统一返回 `records` 列表和 `missing_ids`。
 - `delete_by_ids`
   - 作用：按一批记录 `ids` 从主数据中硬删除记忆。
   - 返回方式：删除命中的记录、同步更新时间线，并基于本地 embedding 缓存重建向量索引后返回最小删除结果。
@@ -174,7 +192,6 @@
 - 服务端不会替调用方判断内容真假；调用方应先完成证据确认和内容整理，再提交入库。
 - 正式入库内容只允许包含已验证的事实、用户明确实践过的操作，或能被文件、截图、日志、命令输出直接证明的结论；不得补写未经验证的推测、归因或建议。
 - 如果已有相似且已验证的内容，优先融合进已有记录或本次更新，不要重复堆新的近似表述。
-- 如果本次写入和历史记录完全一致，`save` 会去重，并返回 `deduped=true`。
 - 每次 `save` 成功后，都会同步刷新时间线和向量索引；当前实现会优先只对新记录做增量 embedding。
 - 如果缓存缺失或当前库状态无法安全复用旧向量，服务端会先写入主数据，再把全量 embedding 放到后台执行，并返回一个 `rebuilding` 提示；这段时间 `search` 不可用。
 - 一般 ai 的调用流程如下：
@@ -246,9 +263,6 @@
   - 第一次入库时间。
 - `tags`
   - 最终落库标签数组。
-- `deduped`
-  - 是否命中了去重。
-  - `true` 表示这次没有新增记录，而是复用了已有记录。
 - `total_entries`
   - 当前主库总记录数。
 - `timeline_summary`
@@ -326,10 +340,11 @@ save：先规范化新记录，读老主数据进内存，然后拼接成新主�
 然后向量化新记录并把新向量补进字典:  
 -- cached_vector_by_id[appended_entry_id] = appended_embedding
 
-然后脚本根据这个 dict 以及新主数据的 id 顺序（current_entry_ids ），去重拼并落盘新faiss、meta和npy：  
+然后脚本根据这个 dict 以及新主数据的 id 顺序（current_entry_ids ），按最新顺序重拼并落盘新faiss、meta和npy：  
 memory_embeddings.npy <- rebuilt_embeddings  
 memory.faiss <- 基于 rebuilt_embeddings 重建  
 meta_NpyRow-to-id.json <- sorted_entries 的 id 顺序
+这个 meta 文件里还会保存 `embedding_model_fingerprint`，只用于校验当前索引是不是由同一个 embedding 模型目录生成。  
 
 ## `save_chatEvent` 接口
 
@@ -341,7 +356,6 @@ meta_NpyRow-to-id.json <- sorted_entries 的 id 顺序
 - 只有在补充刚写入不久的同一事件，或纠正原记录事实错误时，才应优先考虑对旧 `chat_event` 执行 `update`。
 - 服务端不会替调用方判断内容真假；调用方应先完成证据确认和内容整理，再提交入库。
 - 正式入库内容只允许包含已验证的事实、用户明确实践过的操作，或能被文件、截图、日志、命令输出直接证明的结论；不得补写未经验证的推测、归因或建议。
-- 如果与已有已验证内容完全一致，接口仍会按现有去重规则返回 `deduped=true`。
 - 返回字段与现有 `save` 完全一致，不新增专属返回字段。
 
 ### 输入字段
@@ -385,8 +399,7 @@ meta_NpyRow-to-id.json <- sorted_entries 的 id 顺序
 - `update` 不是整条记录替换；`changes` 里传什么字段，就只更新什么字段。
 - `changes` 中新增或替换的内容，只允许包含已验证的事实、用户明确实践过的操作，或能被文件、截图、日志、命令输出直接证明的结论；不要把未验证的推测、归因或建议补进已有记录。
 - 如果只是补充已有相似且已验证的内容，优先融合到原记录，而不是制造重复表达。
-- 如果规范化后的结果和当前记录完全一致，接口会返回 `updated=false`，不重建索引，也不刷新 `updated_at`。
-- 如果更新后的内容与另一条已有记录完全一致，接口会直接报冲突，不会自动合并。
+- 通过校验后，接口会按当前类型把这次变更写回主数据，并刷新 `updated_at` 与受影响索引。
 - 当前实现会优先只重算被更新主记忆本体，以及本次受影响字段对应的 `field_record` 子记录向量。
 - 如果缓存缺失或当前库状态无法安全复用旧向量，服务端会先写入主数据，再把全量 embedding 放到后台执行，并返回一个 `rebuilding` 提示；这段时间 `search` 不可用。
 - `field_record` 属于内部索引资产，不能通过 `update` 直接修改。
@@ -416,7 +429,6 @@ meta_NpyRow-to-id.json <- sorted_entries 的 id 顺序
   - 如果需要切换记忆类型，不要把 `memory_kind` 塞进 `changes`；应改为调用 `save` 新建正确类型，再按需要删除旧记录。
   - 不允许直接修改：
     - `id`
-    - `fingerprint`
     - `created_at`
     - `updated_at`
     - `retrieval_fields`
@@ -438,8 +450,7 @@ meta_NpyRow-to-id.json <- sorted_entries 的 id 顺序
   - 更新后的最终标签数组。
 - `updated`
   - 是否真的发生了更新。
-  - `true` 表示已更新并重建。
-  - `false` 表示这是一次 no-op。
+  - 当前成功写回时固定为 `true`。
 - `total_entries`
   - 当前主库总记录数。
 - `timeline_summary`
@@ -535,7 +546,6 @@ meta_NpyRow-to-id.json <- sorted_entries 的 id 顺序
 - 这个接口不做向量搜索，只负责按主键回源主数据。
 - 即使只读取一条，也应传单元素数组。
 - 如果部分 id 不存在，接口不会整体报错，而是通过 `missing_ids` 显式返回缺失项。
-- `include_debug=true` 时，才会附加内部调试字段。
 - `field_record` 属于内部索引资产，不能通过这个接口直接读取。
 
 ### 输入字段
@@ -545,15 +555,11 @@ meta_NpyRow-to-id.json <- sorted_entries 的 id 顺序
   - 要读取的记录 id 数组。
   - 即使只查一条，也要传 `ids=["pmem-xxxx"]`。
   - 通常来自 `search` 结果中的 `id`。
-- `include_debug`
-  - 可选。
-  - 默认 `false`。
-  - 为 `true` 时，会额外返回 `fingerprint` 和 `retrieval_fields`。
 
 ### 返回字段
 
 - `ids`
-  - 清洗、去重后的请求 id 列表。
+  - 清洗后的请求 id 列表；重复 id 只保留首次出现的一项。
 - `records`
   - 已成功命中的详情记录列表。
   - 顺序与输入 `ids` 保持一致。
@@ -572,9 +578,6 @@ meta_NpyRow-to-id.json <- sorted_entries 的 id 顺序
     - `tags`
     - `source_paths`
     - `reference_doc_path`
-  - `include_debug=true` 时，每条记录额外返回：
-    - `fingerprint`
-    - `retrieval_fields`
 - `missing_ids`
   - 本次请求中未找到的 id 列表。
 
@@ -601,7 +604,7 @@ meta_NpyRow-to-id.json <- sorted_entries 的 id 顺序
 ### 返回字段
 
 - `ids`
-  - 清洗、去重后的请求 id 列表。
+  - 清洗后的请求 id 列表；重复 id 只保留首次出现的一项。
 - `deleted_ids`
   - 本次实际删除成功的 id 列表。
 - `missing_ids`
@@ -621,16 +624,15 @@ meta_NpyRow-to-id.json <- sorted_entries 的 id 顺序
   - 仅在后台重建时返回。
   - 用于提示调用方：主数据已经删除，但索引仍在后台补齐。
 
-## 调试字段说明
+## 内部检索字段说明
 
-- `fingerprint`
-  - 这是内部去重和一致性校验字段。
-  - 它的主要作用是判断“这条记录和历史记录是否完全相同”，不适合作为默认业务返回字段。
 - `retrieval_fields`
   - 这是内部检索审计字段，不是 `save` 的输入参数。
-  - 它的作用是说明“这条记录在服务端生成检索文本时，实际用了哪些字段参与 embedding 拼接”，主要用于排查 RAG 命中效果，而不是面向普通使用者展示。
+  - 它说明“这条记录在服务端生成检索文本时，实际用了哪些字段参与 embedding 拼接”，主要用于排查 RAG 命中效果。
+- `retrieval_fields_json`
+  - 这是 `SQLite` 里保存 `retrieval_fields` 的内部列。
+  - 它继续参与检索文本拼接和索引刷新，但不会通过 `get_details_by_ids` 对外返回。
 - 当前默认 embedding 字段不包含 `detailed_summary`，而是优先使用 `title`、`short_summary`、`problem_background`、`analysis`、`action_steps`、`validation_result`、`tags`、`reference_doc_path`。
-- 因此这两个字段默认隐藏，只在 `get_details_by_ids(include_debug=true)` 时返回。
 
 ## 当前实现特点
 

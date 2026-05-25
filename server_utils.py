@@ -16,6 +16,7 @@ import sqlite3
 import sys
 import time
 import threading
+import uuid
 from datetime import datetime
 from contextlib import closing
 from functools import lru_cache
@@ -37,7 +38,7 @@ from embedding_utils import l2_normalize, load_sentence_embedder
 
 CONFIG_DIR = CURRENT_DIR / "config"  # 项目配置目录。
 CONFIG_PATH = CONFIG_DIR / "settings.yaml"  # 项目 YAML 配置文件。
-SQLITE_SCHEMA_VERSION = 2  # SQLite 主数据层自己的 schema 版本；和 memory.store_version 分开维护。
+SQLITE_SCHEMA_VERSION = 3  # SQLite 主数据层自己的 schema 版本；和 memory.store_version 分开维护。
 
 
 # 把 YAML 配置里的路径值解析成当前项目可直接使用的绝对路径；相对路径一律相对脚本文件所在目录。
@@ -161,17 +162,13 @@ def load_project_config() -> dict[str, Any]:
 
     search_fields = results_config.get("search_fields")
     detail_fields = results_config.get("detail_fields")
-    debug_fields = results_config.get("debug_fields")
     if not isinstance(search_fields, list) or not search_fields:
         raise RuntimeError(f"results.search_fields in {CONFIG_PATH.name} must be a non-empty list.")
     if not isinstance(detail_fields, list) or not detail_fields:
         raise RuntimeError(f"results.detail_fields in {CONFIG_PATH.name} must be a non-empty list.")
-    if not isinstance(debug_fields, list):
-        raise RuntimeError(f"results.debug_fields in {CONFIG_PATH.name} must be a list.")
 
     normalized_search_fields = tuple(str(item or "").strip() for item in search_fields if str(item or "").strip())
     normalized_detail_fields = tuple(str(item or "").strip() for item in detail_fields if str(item or "").strip())
-    normalized_debug_fields = tuple(str(item or "").strip() for item in debug_fields if str(item or "").strip())
     if not normalized_search_fields or not normalized_detail_fields:
         raise RuntimeError(f"results section in {CONFIG_PATH.name} must contain valid field names.")
 
@@ -195,7 +192,6 @@ def load_project_config() -> dict[str, Any]:
         "field_labels": normalized_field_labels,
         "search_result_fields": normalized_search_fields,
         "detail_result_fields": normalized_detail_fields,
-        "debug_result_fields": normalized_debug_fields,
     }
 
 
@@ -227,23 +223,23 @@ FIELD_LABELS = PROJECT_CONFIG["field_labels"]  # 检索文本拼接时使用的�
 MEMORY_KIND_VALUES = PROJECT_CONFIG["memory_kind_values"]  # 允许的记忆类型枚举值。
 SEARCH_RESULT_FIELDS = PROJECT_CONFIG["search_result_fields"]  # search 默认返回的轻量字段。
 DETAIL_RESULT_FIELDS = PROJECT_CONFIG["detail_result_fields"]  # 详情接口默认返回的完整业务字段。
-DEBUG_RESULT_FIELDS = PROJECT_CONFIG["debug_result_fields"]  # 仅在调试模式下返回的内部字段。
 
 UPDATE_ALLOWED_FIELDS = (
     "title",
     "short_summary",
+    "overview_summary",
     "detailed_summary",
     "problem_background",
     "analysis",
     "action_steps",
     "validation_result",
+    "project_id",
     "tags",
     "source_paths",
     "reference_doc_path",
 )  # update 补丁允许修改的业务字段。
 UPDATE_SYSTEM_FIELDS = (
     "id",
-    "fingerprint",
     "created_at",
     "updated_at",
     "retrieval_fields",
@@ -260,11 +256,13 @@ PUBLIC_MEMORY_KIND_VALUES = (
     "project_record",
     "chat_event",
     "fact",
+    "project_registry",
 )  # 对外工具允许创建或更新到的公共记忆类型。
 INTERNAL_MEMORY_KIND_VALUES = ("field_record",)  # 只允许服务端内部派生的字段级记忆类型。
 FIELD_RECORD_CANDIDATE_FIELDS = (
     "title",
     "short_summary",
+    "overview_summary",
     "problem_background",
     "analysis",
     "action_steps",
@@ -280,6 +278,16 @@ FACT_RETRIEVAL_FIELD_CANDIDATES = (
     "tags",
     "reference_doc_path",
 )  # fact 的检索文本优先保留稳定事实正文，不沿用项目经验的字段拼接偏好。
+PROJECT_REGISTRY_RETRIEVAL_FIELD_CANDIDATES = (
+    "title",
+    "overview_summary",
+    "tags",
+)  # project_registry 只围绕项目名、项目整体概述和标签做召回，避免把时间和路径字段变成噪音。
+PROJECT_REGISTRY_FIELD_RECORD_CANDIDATE_FIELDS = (
+    "title",
+    "overview_summary",
+    "tags",
+)  # project_registry 只把这 3 个字段拆成 field_record，避免生成无意义的 short_summary 或路径子记录。
 MATCHED_FIELDS_LIMIT = 3  # search 返回的 matched_fields 最多保留 3 个，避免结果对象膨胀。
 BACKGROUND_REBUILD_MODE = "background_full_rebuild"  # 后台全量重建的固定模式名。
 _BACKGROUND_REBUILD_LOCK = threading.Lock()  # 同一进程内的后台重建串行锁。
@@ -292,13 +300,14 @@ SQLITE_ENTRY_COLUMNS = (
     "memory_kind",
     "title",
     "short_summary",
+    "overview_summary",
     "detailed_summary",
     "problem_background",
     "analysis",
     "action_steps",
     "validation_result",
     "reference_doc_path",
-    "fingerprint",
+    "project_id",
     "created_at",
     "updated_at",
     "source_memory_id",
@@ -310,7 +319,6 @@ SQLITE_ENTRY_COLUMNS = (
 SQLITE_REGISTRY_COLUMNS = (
     "id",
     "memory_kind",
-    "fingerprint",
     "created_at",
     "updated_at",
 )
@@ -324,6 +332,16 @@ SQLITE_PROJECT_DETAIL_COLUMNS = (
     "action_steps",
     "validation_result",
     "reference_doc_path",
+    "tags_json",
+    "source_paths_json",
+    "retrieval_fields_json",
+)
+SQLITE_PROJECT_REGISTRY_COLUMNS = (
+    "id",
+    "title",
+    "overview_summary",
+    "reference_doc_path",
+    "project_id",
     "tags_json",
     "source_paths_json",
     "retrieval_fields_json",
@@ -344,7 +362,6 @@ SQLITE_FIELD_RECORD_COLUMNS = (
     "source_field_name",
     "source_field_value_text",
     "source_field_value_json",
-    "fingerprint",
     "created_at",
     "updated_at",
 )
@@ -357,7 +374,7 @@ MemoryKind = Literal["project_record", "chat_event", "fact"]
 
 # 类型声明上这是 Literal[...]，表示主数据实际允许保存的记忆类型全集；运行时仍然是 str，例如 "field_record"。
 # 它和上面的 MemoryKind 不同：MemoryKind 面向工具层输入，StoredMemoryKind 面向主数据与内部派生记录，所以额外包含内部类型 "field_record"。
-StoredMemoryKind = Literal["project_record", "chat_event", "fact", "field_record"]
+StoredMemoryKind = Literal["project_record", "chat_event", "fact", "project_registry", "field_record"]
 
 # TagListInput 是 save.tags 的参数类型别名: 声明层写成 Annotated[list[str] | None, BeforeValidator(...)]，运行时最终拿到的还是 list[str] 或 None，
 # BeforeValidator 会先把 "rag, mcp"、'["rag", "mcp"]' 这类字符串输入整理成 list[str]。
@@ -461,7 +478,6 @@ def build_sqlite_entry_row(entry: dict[str, Any]) -> dict[str, Any]:
     base_row = {
         "id": str(entry.get("id") or "").strip(),
         "memory_kind": normalized_memory_kind,
-        "fingerprint": str(entry.get("fingerprint") or "").strip(),
         "created_at": str(entry.get("created_at") or "").strip(),
         "updated_at": str(entry.get("updated_at") or "").strip(),
     }
@@ -475,6 +491,17 @@ def build_sqlite_entry_row(entry: dict[str, Any]) -> dict[str, Any]:
             "analysis": str(entry.get("analysis") or ""),
             "action_steps": str(entry.get("action_steps") or ""),
             "validation_result": str(entry.get("validation_result") or ""),
+            "reference_doc_path": str(entry.get("reference_doc_path") or ""),
+            "project_id": str(entry.get("project_id") or "").strip() or None,
+            "tags_json": dump_json_string_list(entry.get("tags")),
+            "source_paths_json": dump_json_string_list(entry.get("source_paths")),
+            "retrieval_fields_json": dump_json_string_list(entry.get("retrieval_fields")),
+        }
+    if normalized_memory_kind == "project_registry":
+        return {
+            **base_row,
+            "title": str(entry.get("title") or ""),
+            "overview_summary": str(entry.get("overview_summary") or ""),
             "reference_doc_path": str(entry.get("reference_doc_path") or ""),
             "tags_json": dump_json_string_list(entry.get("tags")),
             "source_paths_json": dump_json_string_list(entry.get("source_paths")),
@@ -508,10 +535,13 @@ def build_sqlite_entry_row(entry: dict[str, Any]) -> dict[str, Any]:
 def build_entry_from_sqlite_row(row: sqlite3.Row | dict[str, Any]) -> dict[str, Any]:
     row_data = dict(row)
     normalized_memory_kind = str(row_data.get("memory_kind") or "").strip()
+    normalized_title = str(row_data.get("title") or "")
+    normalized_overview_summary = str(row_data.get("overview_summary") or "")
+    normalized_short_summary = str(row_data.get("short_summary") or "")
+    normalized_project_id = str(row_data.get("project_id") or "").strip()
     common_entry = {
         "id": str(row_data.get("id") or "").strip(),
         "memory_kind": normalized_memory_kind,
-        "fingerprint": str(row_data.get("fingerprint") or "").strip(),
         "created_at": str(row_data.get("created_at") or "").strip(),
         "updated_at": str(row_data.get("updated_at") or "").strip(),
     }
@@ -522,12 +552,14 @@ def build_entry_from_sqlite_row(row: sqlite3.Row | dict[str, Any]) -> dict[str, 
             **common_entry,
             "title": "",
             "short_summary": "",
+            "overview_summary": "",
             "detailed_summary": "",
             "problem_background": "",
             "analysis": "",
             "action_steps": "",
             "validation_result": "",
             "reference_doc_path": field_value if source_field_name == "reference_doc_path" else "",
+            "project_id": "",
             "source_memory_id": str(row_data.get("source_memory_id") or "").strip(),
             "source_field_name": source_field_name,
             "tags": list(field_value) if source_field_name == "tags" and isinstance(field_value, list) else [],
@@ -537,16 +569,26 @@ def build_entry_from_sqlite_row(row: sqlite3.Row | dict[str, Any]) -> dict[str, 
             "source_field_value_json": str(row_data.get("source_field_value_json") or ""),
             source_field_name: field_value,
         }
+    if normalized_memory_kind == "project_registry" and not normalized_short_summary:
+        normalized_short_summary = build_short_summary(
+            title=normalized_title,
+            detailed_summary=normalized_overview_summary,
+        )
+    normalized_detailed_summary = str(row_data.get("detailed_summary") or "")
+    if normalized_memory_kind == "project_registry" and not normalized_detailed_summary:
+        normalized_detailed_summary = normalized_overview_summary
     return {
         **common_entry,
-        "title": str(row_data.get("title") or ""),
-        "short_summary": str(row_data.get("short_summary") or ""),
-        "detailed_summary": str(row_data.get("detailed_summary") or ""),
+        "title": normalized_title,
+        "short_summary": normalized_short_summary,
+        "overview_summary": normalized_overview_summary,
+        "detailed_summary": normalized_detailed_summary,
         "problem_background": str(row_data.get("problem_background") or ""),
         "analysis": str(row_data.get("analysis") or ""),
         "action_steps": str(row_data.get("action_steps") or ""),
         "validation_result": str(row_data.get("validation_result") or ""),
         "reference_doc_path": str(row_data.get("reference_doc_path") or ""),
+        "project_id": normalized_project_id or (common_entry["id"] if normalized_memory_kind == "project_registry" else ""),
         "source_memory_id": "",
         "source_field_name": "",
         "tags": load_json_string_list(row_data.get("tags_json")),
@@ -581,7 +623,6 @@ def create_split_sqlite_schema_objects(connection: sqlite3.Connection) -> None:
         CREATE TABLE IF NOT EXISTS memory_registry (
             id TEXT PRIMARY KEY,
             memory_kind TEXT NOT NULL,
-            fingerprint TEXT NOT NULL,
             created_at TEXT NOT NULL,
             updated_at TEXT NOT NULL
         )
@@ -598,6 +639,20 @@ def create_split_sqlite_schema_objects(connection: sqlite3.Connection) -> None:
             analysis TEXT NOT NULL,
             action_steps TEXT NOT NULL,
             validation_result TEXT NOT NULL,
+            reference_doc_path TEXT NOT NULL,
+            project_id TEXT,
+            tags_json TEXT NOT NULL,
+            source_paths_json TEXT NOT NULL,
+            retrieval_fields_json TEXT NOT NULL
+        )
+        """
+    )
+    connection.execute(
+        """
+        CREATE TABLE IF NOT EXISTS project_registry (
+            id TEXT PRIMARY KEY,
+            title TEXT NOT NULL,
+            overview_summary TEXT NOT NULL,
             reference_doc_path TEXT NOT NULL,
             tags_json TEXT NOT NULL,
             source_paths_json TEXT NOT NULL,
@@ -641,7 +696,6 @@ def create_split_sqlite_schema_objects(connection: sqlite3.Connection) -> None:
             source_field_name TEXT NOT NULL,
             source_field_value_text TEXT NOT NULL,
             source_field_value_json TEXT NOT NULL,
-            fingerprint TEXT NOT NULL,
             created_at TEXT NOT NULL,
             updated_at TEXT NOT NULL
         )
@@ -649,7 +703,8 @@ def create_split_sqlite_schema_objects(connection: sqlite3.Connection) -> None:
     )
     connection.execute("CREATE INDEX IF NOT EXISTS idx_memory_registry_memory_kind ON memory_registry(memory_kind)")
     connection.execute("CREATE INDEX IF NOT EXISTS idx_memory_registry_updated_at ON memory_registry(updated_at)")
-    connection.execute("CREATE INDEX IF NOT EXISTS idx_memory_registry_fingerprint ON memory_registry(fingerprint)")
+    connection.execute("CREATE INDEX IF NOT EXISTS idx_project_records_project_id ON project_records(project_id)")
+    connection.execute("CREATE INDEX IF NOT EXISTS idx_project_registry_title ON project_registry(title)")
     connection.execute("CREATE INDEX IF NOT EXISTS idx_field_records_source_memory_id ON field_records(source_memory_id)")
     connection.execute("CREATE INDEX IF NOT EXISTS idx_field_records_source_field_name ON field_records(source_field_name)")
     connection.execute(
@@ -664,13 +719,14 @@ def create_split_sqlite_schema_objects(connection: sqlite3.Connection) -> None:
             registry.memory_kind AS memory_kind,
             detail.title AS title,
             detail.short_summary AS short_summary,
+            detail.overview_summary AS overview_summary,
             detail.detailed_summary AS detailed_summary,
             detail.problem_background AS problem_background,
             detail.analysis AS analysis,
             detail.action_steps AS action_steps,
             detail.validation_result AS validation_result,
             detail.reference_doc_path AS reference_doc_path,
-            registry.fingerprint AS fingerprint,
+            detail.project_id AS project_id,
             registry.created_at AS created_at,
             registry.updated_at AS updated_at,
             '' AS source_memory_id,
@@ -686,12 +742,14 @@ def create_split_sqlite_schema_objects(connection: sqlite3.Connection) -> None:
                 id,
                 title,
                 short_summary,
+                '' AS overview_summary,
                 detailed_summary,
                 problem_background,
                 analysis,
                 action_steps,
                 validation_result,
                 reference_doc_path,
+                project_id,
                 tags_json,
                 source_paths_json,
                 retrieval_fields_json,
@@ -702,12 +760,14 @@ def create_split_sqlite_schema_objects(connection: sqlite3.Connection) -> None:
                 id,
                 title,
                 short_summary,
+                '' AS overview_summary,
                 detailed_summary,
                 '' AS problem_background,
                 '' AS analysis,
                 '' AS action_steps,
                 '' AS validation_result,
                 reference_doc_path,
+                '' AS project_id,
                 tags_json,
                 source_paths_json,
                 retrieval_fields_json,
@@ -718,17 +778,37 @@ def create_split_sqlite_schema_objects(connection: sqlite3.Connection) -> None:
                 id,
                 title,
                 short_summary,
+                '' AS overview_summary,
                 detailed_summary,
                 '' AS problem_background,
                 '' AS analysis,
                 '' AS action_steps,
                 '' AS validation_result,
                 reference_doc_path,
+                '' AS project_id,
                 tags_json,
                 source_paths_json,
                 retrieval_fields_json,
                 'fact' AS memory_kind
             FROM facts
+            UNION ALL
+            SELECT
+                id,
+                title,
+                '' AS short_summary,
+                overview_summary,
+                '' AS detailed_summary,
+                '' AS problem_background,
+                '' AS analysis,
+                '' AS action_steps,
+                '' AS validation_result,
+                reference_doc_path,
+                id AS project_id,
+                tags_json,
+                source_paths_json,
+                retrieval_fields_json,
+                'project_registry' AS memory_kind
+            FROM project_registry
         ) AS detail
         ON registry.id = detail.id AND registry.memory_kind = detail.memory_kind
         """
@@ -742,13 +822,14 @@ def create_split_sqlite_schema_objects(connection: sqlite3.Connection) -> None:
             memory_kind,
             title,
             short_summary,
+            overview_summary,
             detailed_summary,
             problem_background,
             analysis,
             action_steps,
             validation_result,
             reference_doc_path,
-            fingerprint,
+            project_id,
             created_at,
             updated_at,
             source_memory_id,
@@ -765,13 +846,14 @@ def create_split_sqlite_schema_objects(connection: sqlite3.Connection) -> None:
             'field_record' AS memory_kind,
             '' AS title,
             '' AS short_summary,
+            '' AS overview_summary,
             '' AS detailed_summary,
             '' AS problem_background,
             '' AS analysis,
             '' AS action_steps,
             '' AS validation_result,
             '' AS reference_doc_path,
-            field_records.fingerprint AS fingerprint,
+            '' AS project_id,
             field_records.created_at AS created_at,
             field_records.updated_at AS updated_at,
             field_records.source_memory_id AS source_memory_id,
@@ -786,9 +868,24 @@ def create_split_sqlite_schema_objects(connection: sqlite3.Connection) -> None:
     )
 
 
+# 把现有 schema v2 就地升级到 v3；这里只补 project_registry 物理表和 project_records.project_id，不动旧 project_record 内容。
+def migrate_sqlite_schema_v2_to_v3(connection: sqlite3.Connection) -> None:
+    existing_project_record_columns = {
+        str(row["name"] or "").strip()
+        for row in connection.execute("PRAGMA table_info(project_records)").fetchall()
+    }
+    if "project_id" not in existing_project_record_columns:
+        connection.execute("ALTER TABLE project_records ADD COLUMN project_id TEXT")
+
+
 # 在 SQLite 中初始化当前分表 schema；这里只接管空库或已经切到分表版本的数据库文件。
 def initialize_sqlite_schema(connection: sqlite3.Connection) -> None:
-    current_schema_version = ensure_supported_sqlite_schema_version(connection)
+    current_schema_version = ensure_supported_sqlite_schema_version(
+        connection,
+        allowed_versions={0, 2, SQLITE_SCHEMA_VERSION},
+    )
+    if current_schema_version == 2:
+        migrate_sqlite_schema_v2_to_v3(connection)
     create_split_sqlite_schema_objects(connection)
     if current_schema_version != SQLITE_SCHEMA_VERSION:
         connection.execute(f"PRAGMA user_version = {SQLITE_SCHEMA_VERSION}")
@@ -800,17 +897,15 @@ def upsert_memory_registry(entries: list[dict[str, Any]], connection: sqlite3.Co
         return
     connection.executemany(
         """
-        INSERT OR REPLACE INTO memory_registry (
-            id, memory_kind, fingerprint, created_at, updated_at
+        INSERT OR REPLACE INTO memory_registry ( id, memory_kind, created_at, updated_at
         ) VALUES (
-            :id, :memory_kind, :fingerprint, :created_at, :updated_at
+            :id, :memory_kind, :created_at, :updated_at
         )
         """,
         [
             {
                 "id": str(entry.get("id") or "").strip(),
                 "memory_kind": str(entry.get("memory_kind") or "").strip(),
-                "fingerprint": str(entry.get("fingerprint") or "").strip(),
                 "created_at": str(entry.get("created_at") or "").strip(),
                 "updated_at": str(entry.get("updated_at") or "").strip(),
             }
@@ -827,6 +922,7 @@ def upsert_public_memory_details(entries: list[dict[str, Any]], connection: sqli
         "project_record": [],
         "chat_event": [],
         "fact": [],
+        "project_registry": [],
     }
     for entry in entries:
         memory_kind = str(entry.get("memory_kind") or "").strip()
@@ -839,11 +935,11 @@ def upsert_public_memory_details(entries: list[dict[str, Any]], connection: sqli
             """
             INSERT OR REPLACE INTO project_records (
                 id, title, short_summary, detailed_summary, problem_background,
-                analysis, action_steps, validation_result, reference_doc_path,
+                analysis, action_steps, validation_result, reference_doc_path, project_id,
                 tags_json, source_paths_json, retrieval_fields_json
             ) VALUES (
                 :id, :title, :short_summary, :detailed_summary, :problem_background,
-                :analysis, :action_steps, :validation_result, :reference_doc_path,
+                :analysis, :action_steps, :validation_result, :reference_doc_path, :project_id,
                 :tags_json, :source_paths_json, :retrieval_fields_json
             )
             """,
@@ -875,6 +971,19 @@ def upsert_public_memory_details(entries: list[dict[str, Any]], connection: sqli
             """,
             grouped_entries["fact"],
         )
+    if grouped_entries["project_registry"]:
+        connection.executemany(
+            """
+            INSERT OR REPLACE INTO project_registry (
+                id, title, overview_summary, reference_doc_path,
+                tags_json, source_paths_json, retrieval_fields_json
+            ) VALUES (
+                :id, :title, :overview_summary, :reference_doc_path,
+                :tags_json, :source_paths_json, :retrieval_fields_json
+            )
+            """,
+            grouped_entries["project_registry"],
+        )
 
 
 # 把 field_record 写进最小必要字段表；这里不再把一堆公共业务空列物理落盘。
@@ -884,11 +993,10 @@ def upsert_field_record_rows(entries: list[dict[str, Any]], connection: sqlite3.
     connection.executemany(
         """
         INSERT OR REPLACE INTO field_records (
-            id, source_memory_id, source_field_name, source_field_value_text,
-            source_field_value_json, fingerprint, created_at, updated_at
+            id, source_memory_id, source_field_name, source_field_value_text, source_field_value_json, created_at, updated_at
         ) VALUES (
             :id, :source_memory_id, :source_field_name, :source_field_value_text,
-            :source_field_value_json, :fingerprint, :created_at, :updated_at
+            :source_field_value_json, :created_at, :updated_at
         )
         """,
         [build_sqlite_entry_row(entry) for entry in entries],
@@ -938,13 +1046,14 @@ def fetch_field_record_entries_by_ids(record_ids: list[str], connection: sqlite3
                 'field_record' AS memory_kind,
                 '' AS title,
                 '' AS short_summary,
+                '' AS overview_summary,
                 '' AS detailed_summary,
                 '' AS problem_background,
                 '' AS analysis,
                 '' AS action_steps,
                 '' AS validation_result,
                 '' AS reference_doc_path,
-                fingerprint,
+                '' AS project_id,
                 created_at,
                 updated_at,
                 source_memory_id,
@@ -1008,7 +1117,7 @@ def delete_store_entries_by_ids(record_ids: list[str], connection: sqlite3.Conne
             f"SELECT id, memory_kind FROM memory_registry WHERE id IN ({placeholders})",
             normalized_ids,
         ).fetchall()
-        ids_by_kind: dict[str, list[str]] = {"project_record": [], "chat_event": [], "fact": []}
+        ids_by_kind: dict[str, list[str]] = {"project_record": [], "chat_event": [], "fact": [], "project_registry": []}
         for row in registry_rows:
             memory_kind = str(row["memory_kind"] or "").strip()
             if memory_kind in ids_by_kind:
@@ -1021,6 +1130,7 @@ def delete_store_entries_by_ids(record_ids: list[str], connection: sqlite3.Conne
                 "project_record": "project_records",
                 "chat_event": "chat_events",
                 "fact": "facts",
+                "project_registry": "project_registry",
             }[memory_kind]
             db.execute(f"DELETE FROM {target_table} WHERE id IN ({detail_placeholders})", ids_for_kind)
         db.execute(f"DELETE FROM memory_registry WHERE id IN ({placeholders})", normalized_ids)
@@ -1121,28 +1231,48 @@ def fetch_store_entry_by_id(record_id: str) -> dict[str, Any] | None:
     return fetched_entries[0] if fetched_entries else None
 
 
-# 按 fingerprint 定位公共主记忆；save 去重和 update 冲突检查都只看非 field_record 记录。
-def fetch_public_entry_by_fingerprint(fingerprint: str, exclude_id: str | None = None) -> dict[str, Any] | None:
+# 按项目标题读取 project_registry；create_project 用它挡住重复项目名。
+def fetch_project_registry_entry_by_title(title: str) -> dict[str, Any] | None:
     ensure_sqlite_store_ready()
-    normalized_fingerprint = str(fingerprint or "").strip()
-    if not normalized_fingerprint:
+    normalized_title = collapse_text(title)
+    if not normalized_title:
         return None
-
-    query = f"""
-        SELECT {', '.join(SQLITE_ENTRY_COLUMNS)}, source_field_value_text, source_field_value_json
-        FROM {PUBLIC_MEMORY_VIEW}
-        WHERE fingerprint = ?
-    """
-    params: list[Any] = [normalized_fingerprint]
-    if exclude_id:
-        query += " AND id != ?"
-        params.append(str(exclude_id or "").strip())
-    query += f" ORDER BY {SQLITE_ENTRY_ORDER_BY} LIMIT 1"
     with closing(get_sqlite_connection()) as connection:
-        row = connection.execute(query, params).fetchone()
+        row = connection.execute(
+            f"""
+            SELECT {', '.join(SQLITE_ENTRY_COLUMNS)}, source_field_value_text, source_field_value_json
+            FROM {PUBLIC_MEMORY_VIEW}
+            WHERE memory_kind = 'project_registry' AND title = ?
+            ORDER BY {SQLITE_ENTRY_ORDER_BY}
+            LIMIT 1
+            """,
+            (normalized_title,),
+        ).fetchone()
     if row is None:
         return None
     return build_entry_from_sqlite_row(row)
+
+
+# 判断某个 project_registry 下面是否仍挂着项目问题；delete_by_ids 会先用它挡住误删。
+def project_registry_has_project_records(project_id: str) -> bool:
+    ensure_sqlite_store_ready()
+    normalized_project_id = str(project_id or "").strip()
+    if not normalized_project_id:
+        return False
+    with closing(get_sqlite_connection()) as connection:
+        row = connection.execute(
+            """
+            SELECT 1 AS exists_value
+            FROM project_records
+            WHERE project_id = ?
+            LIMIT 1
+            """,
+            (normalized_project_id,),
+        ).fetchone()
+    return row is not None
+
+
+
 
 
 # 读取一批 source_memory_id 相关的当前家族记录，包含主记忆本体和它当前仍存在的 field_record 子记录。
@@ -1165,13 +1295,14 @@ def fetch_entry_family_by_source_ids(source_ids: set[str]) -> list[dict[str, Any
                 'field_record' AS memory_kind,
                 '' AS title,
                 '' AS short_summary,
+                '' AS overview_summary,
                 '' AS detailed_summary,
                 '' AS problem_background,
                 '' AS analysis,
                 '' AS action_steps,
                 '' AS validation_result,
                 '' AS reference_doc_path,
-                fingerprint,
+                '' AS project_id,
                 created_at,
                 updated_at,
                 source_memory_id,
@@ -1279,7 +1410,7 @@ def ensure_sqlite_store_ready() -> None:
             connection.commit()
 
 
-# 把自由文本压缩成单行紧凑字符串，避免空白符干扰去重和存储。
+# 把自由文本压缩成单行紧凑字符串，避免空白符干扰存储和字段比较。
 # 比如 "A\nB" -> "A B"
 def collapse_text(value: str | None) -> str:
     return " ".join(str(value or "").split()).strip()
@@ -1400,7 +1531,7 @@ def normalize_memory_kind(value: str | None) -> StoredMemoryKind:
     normalized = collapse_text(value)
     if normalized not in MEMORY_KIND_VALUES:
         raise ValueError(
-            "memory_kind must be one of 'project_record', 'chat_event', 'fact' or 'field_record'"
+            "memory_kind must be one of 'project_record', 'chat_event', 'fact', 'project_registry' or 'field_record'"
         )
     return normalized  # type: ignore[return-value]
 
@@ -1409,6 +1540,84 @@ def normalize_memory_kind(value: str | None) -> StoredMemoryKind:
 # 输入是主数据中的单条记录 dict；输出是 bool，True 表示它的 memory_kind 是内部类型 field_record。
 def is_field_record_entry(entry: dict[str, Any]) -> bool:
     return str(entry.get("memory_kind") or "").strip() == "field_record"
+
+
+# 按主记忆类型返回允许 update 的业务字段集合；server.py 会先拿它校验补丁，再决定是否继续重建 payload。
+def get_update_allowed_fields_for_memory_kind(memory_kind: str) -> tuple[str, ...]:
+    normalized_memory_kind = str(memory_kind or "").strip()
+    if normalized_memory_kind == "project_record":
+        return (
+            "title",
+            "short_summary",
+            "detailed_summary",
+            "problem_background",
+            "analysis",
+            "action_steps",
+            "validation_result",
+            "tags",
+            "source_paths",
+            "reference_doc_path",
+        )
+    if normalized_memory_kind == "project_registry":
+        return (
+            "title",
+            "overview_summary",
+            "tags",
+            "source_paths",
+            "reference_doc_path",
+        )
+    return (
+        "title",
+        "short_summary",
+        "detailed_summary",
+        "tags",
+        "source_paths",
+        "reference_doc_path",
+    )
+
+
+# 基于已经取到的源记录，进一步拦住“字段名虽然全局存在，但不属于该类型”的 update 补丁。
+def validate_update_changes_for_entry(source_entry: dict[str, Any], changes: dict[str, Any]) -> dict[str, Any]:
+    resolved_memory_kind = str(source_entry.get("memory_kind") or "").strip()
+    allowed_fields = set(get_update_allowed_fields_for_memory_kind(resolved_memory_kind))
+    unsupported_fields = [
+        field_name
+        for field_name in changes
+        if field_name not in allowed_fields
+    ]
+    if unsupported_fields:
+        unsupported_fields_text = ", ".join(sorted(unsupported_fields))
+        raise ValueError(
+            f"changes contains fields unsupported for {resolved_memory_kind}: {unsupported_fields_text}"
+        )
+    return changes
+
+
+# 按主记忆类型返回这一类记录真正应该拆成 field_record 的字段范围。
+def get_field_record_candidate_fields_for_memory_kind(memory_kind: str) -> tuple[str, ...]:
+    normalized_memory_kind = str(memory_kind or "").strip()
+    if normalized_memory_kind == "project_registry":
+        return PROJECT_REGISTRY_FIELD_RECORD_CANDIDATE_FIELDS
+    return tuple(
+        field_name
+        for field_name in FIELD_RECORD_CANDIDATE_FIELDS
+        if field_name != "overview_summary"
+    )
+
+
+# 按主记忆类型返回真正参与 embedding 文本拼接的字段范围。
+def get_retrieval_field_candidates_for_memory_kind(memory_kind: str) -> tuple[str, ...]:
+    normalized_memory_kind = str(memory_kind or "").strip()
+    if normalized_memory_kind == "fact":
+        return FACT_RETRIEVAL_FIELD_CANDIDATES
+    if normalized_memory_kind == "project_registry":
+        return PROJECT_REGISTRY_RETRIEVAL_FIELD_CANDIDATES
+    return tuple(RETRIEVAL_FIELD_CANDIDATES)
+
+
+# 生成项目注册表的稳定 id；create_project 会先调这里拿到 proj- 前缀 id，再把它写进 project_registry 和 memory_registry。
+def build_project_id() -> str:
+    return f"proj-{hashlib.sha256(f'{now_iso()}|{time.time_ns()}'.encode('utf-8')).hexdigest()[:12]}"
 
 
 # 从整库记录里筛出对外可见的主记忆；它服务于时间线、search 折叠回源、total_entries 统计等链路。
@@ -1464,6 +1673,8 @@ def build_fallback_tags(memory_kind: StoredMemoryKind, title: str, detailed_summ
         generated.append("chat-event")
     elif memory_kind == "fact":
         generated.append("fact")
+    elif memory_kind == "project_registry":
+        generated.append("project-registry")
     else:
         generated.append("field-record")
 
@@ -1537,10 +1748,9 @@ def build_one_hot_field_record_entry(
         "retrieval_fields": [source_field_name],
     }
     payload[source_field_name] = list(field_value) if isinstance(field_value, list) else field_value
-    field_fingerprint = payload_fingerprint(payload)
+    
     return {
-        "id": build_field_record_id(source_memory_id, source_field_name, field_fingerprint),
-        "fingerprint": field_fingerprint,
+        "id": build_field_record_id(source_memory_id, source_field_name),
         "created_at": created_at,
         "updated_at": updated_at,
         "source_memory_id": source_memory_id,
@@ -1605,16 +1815,13 @@ def build_short_summary(
 # 按当前记忆类型计算真正参与向量拼接的字段名列表。
 def build_retrieval_fields(entry: dict[str, Any]) -> list[str]:
     memory_kind = str(entry.get("memory_kind") or "").strip()
-    if memory_kind == "fact":
-        field_candidates = FACT_RETRIEVAL_FIELD_CANDIDATES
-    elif memory_kind == "field_record":
+    if memory_kind == "field_record":
         source_field_name = str(entry.get("source_field_name") or "").strip()
         if source_field_name not in FIELD_RECORD_CANDIDATE_FIELDS:
             return []
         field_value = resolve_field_record_value(entry, source_field_name)
         return [source_field_name] if field_value else []
-    else:
-        field_candidates = RETRIEVAL_FIELD_CANDIDATES
+    field_candidates = get_retrieval_field_candidates_for_memory_kind(memory_kind)
 
     fields: list[str] = []
     for field_name in field_candidates:
@@ -1660,16 +1867,18 @@ def preview_text(value: str | None, limit: int = 160) -> str:
     return f"{single_line[:limit].rstrip()}..."
 
 
-# 生成标准化后的记录载荷，作为去重和持久化的统一输入。
+# 生成标准化后的记录载荷，作为写入、更新和向量拼接的统一输入。
 def build_payload(
     memory_kind: str,
     title: str,
     detailed_summary: str,
     short_summary: str | None = None,
+    overview_summary: str | None = None,
     problem_background: str | None = None,
     analysis: str | None = None,
     action_steps: str | None = None,
     validation_result: str | None = None,
+    project_id: str | None = None,
     tags: list[str] | str | None = None,
     source_paths: list[str] | str | None = None,
     reference_doc_path: str | None = None,
@@ -1679,11 +1888,13 @@ def build_payload(
 ) -> dict[str, Any]:
     resolved_memory_kind = normalize_memory_kind(memory_kind)
     resolved_title = collapse_text(title)
+    resolved_overview_summary = normalize_text_block(overview_summary)
     resolved_problem_background = normalize_text_block(problem_background)
     resolved_analysis = normalize_text_block(analysis)
     resolved_action_steps = normalize_text_block(action_steps)
     resolved_validation_result = normalize_text_block(validation_result)
     resolved_detailed_summary = normalize_text_block(detailed_summary)
+    resolved_project_id = collapse_text(project_id)
     resolved_source_paths = normalize_list(coerce_source_path_list_input(source_paths))
     resolved_reference_doc_path = resolve_reference_doc_path(
         reference_doc_path,
@@ -1693,10 +1904,14 @@ def build_payload(
 
     if not resolved_title:
         raise ValueError("title is required")
-    if not resolved_detailed_summary:
-        raise ValueError("detailed_summary is required")
-    if require_short_summary and not collapse_text(short_summary):
-        raise ValueError("short_summary is required")
+    if resolved_memory_kind == "project_registry":
+        if not resolved_overview_summary:
+            raise ValueError("overview_summary is required for project_registry")
+    else:
+        if not resolved_detailed_summary:
+            raise ValueError("detailed_summary is required")
+        if require_short_summary and not collapse_text(short_summary):
+            raise ValueError("short_summary is required")
     if resolved_memory_kind == "project_record" and strict_project_requirements:
         if not resolved_problem_background:
             raise ValueError("problem_background is required for project_record")
@@ -1714,21 +1929,30 @@ def build_payload(
             detailed_summary=resolved_detailed_summary,
         )
 
-    resolved_short_summary = build_short_summary(
-        title=resolved_title,
-        detailed_summary=resolved_detailed_summary,
-        short_summary=short_summary,
-    )
+    if resolved_memory_kind == "project_registry":
+        resolved_short_summary = build_short_summary(
+            title=resolved_title,
+            detailed_summary=resolved_overview_summary,
+        )
+        resolved_detailed_summary = resolved_overview_summary
+    else:
+        resolved_short_summary = build_short_summary(
+            title=resolved_title,
+            detailed_summary=resolved_detailed_summary,
+            short_summary=short_summary,
+        )
 
     payload = {
         "memory_kind": resolved_memory_kind,
         "title": resolved_title,
         "short_summary": resolved_short_summary,
+        "overview_summary": resolved_overview_summary if resolved_memory_kind == "project_registry" else "",
         "problem_background": resolved_problem_background,
         "analysis": resolved_analysis,
         "action_steps": resolved_action_steps,
         "validation_result": resolved_validation_result,
         "detailed_summary": resolved_detailed_summary,
+        "project_id": resolved_project_id if resolved_memory_kind in {"project_record", "project_registry"} else "",
         "tags": resolved_tags,
         "source_paths": resolved_source_paths,
         "reference_doc_path": resolved_reference_doc_path,
@@ -1737,38 +1961,44 @@ def build_payload(
     return payload
 
 
-# 对标准载荷做哈希，便于安全地判断是否重复保存。
-def payload_fingerprint(payload: dict[str, Any]) -> str:
-    payload_json = json.dumps(payload, ensure_ascii=False, sort_keys=True)
-    return hashlib.sha256(payload_json.encode("utf-8")).hexdigest()
-
-
-# 基于指纹生成稳定的记录 id。
-def payload_id(fingerprint: str) -> str:
-    return f"pmem-{fingerprint[:12]}"
+# 基于类型生成新的带 UUID 后缀的随机 ID。
+def generate_memory_id(memory_kind: str) -> str:
+    normalized_kind = str(memory_kind or "").strip()
+    uuid_suffix = uuid.uuid4().hex[:12]
+    if normalized_kind == "project_registry":
+        return f"projRegisterMemId-{uuid_suffix}"
+    elif normalized_kind == "project_record":
+        return f"projMemId-{uuid_suffix}"
+    elif normalized_kind == "fact":
+        return f"factMemId-{uuid_suffix}"
+    elif normalized_kind == "chat_event":
+        return f"eventMemId-{uuid_suffix}"
+    return f"pmem-{uuid_suffix}"
 
 
 # 为内部 field_record 生成稳定 id；它属于服务端派生规则，不直接暴露给 save/update 调用方。
-# 输入包括源头主记忆 id、原字段名和字段级 payload 指纹；输出是稳定的 str 类型内部记录 id，例如 fmem-xxxx。
-def build_field_record_id(source_memory_id: str, source_field_name: str, fingerprint: str) -> str:
-    id_seed = f"{source_memory_id}|{source_field_name}|{fingerprint}"
+# 输入包括源头主记忆 id 和原字段名；输出是稳定的 str 类型内部记录 id，例如 fmem-xxxx。
+def build_field_record_id(source_memory_id: str, source_field_name: str) -> str:
+    id_seed = f"{source_memory_id}|{source_field_name}"
     return f"fmem-{hashlib.sha256(id_seed.encode('utf-8')).hexdigest()[:12]}"
 
 
 # 把主数据中的单条记录规范成当前正式 schema。
-# 输入必须已经是当前字段口径；这个函数负责统一正文、检索字段、id、fingerprint 和时间字段。
+# 输入必须已经是当前字段口径；这个函数负责统一正文、检索字段、id 和时间字段。
 def normalize_store_entry(entry: dict[str, Any]) -> dict[str, Any]:
     if not isinstance(entry, dict):
         raise RuntimeError(f"Every entry in {SQLITE_PATH.name} must be an object")
 
     raw_title = entry.get("title")
     raw_short_summary = entry.get("short_summary")
+    raw_overview_summary = entry.get("overview_summary")
     raw_problem_background = entry.get("problem_background")
     raw_analysis = entry.get("analysis")
     raw_action_steps = entry.get("action_steps")
     raw_validation_result = entry.get("validation_result")
     raw_memory_kind = entry.get("memory_kind") or "project_record"
     raw_detailed_summary = entry.get("detailed_summary")
+    raw_project_id = entry.get("project_id")
     raw_source_paths = entry.get("source_paths")
     raw_reference_doc_path = entry.get("reference_doc_path")
     raw_created_at = entry.get("created_at")
@@ -1800,10 +2030,12 @@ def normalize_store_entry(entry: dict[str, Any]) -> dict[str, Any]:
         title=str(raw_title or ""),
         detailed_summary=str(raw_detailed_summary or ""),
         short_summary=str(raw_short_summary or ""),
+        overview_summary=str(raw_overview_summary or ""),
         problem_background=str(raw_problem_background or ""),
         analysis=str(raw_analysis or ""),
         action_steps=str(raw_action_steps or ""),
         validation_result=str(raw_validation_result or ""),
+        project_id=str(raw_project_id or ""),
         tags=entry.get("tags"),
         source_paths=raw_source_paths,
         reference_doc_path=str(raw_reference_doc_path or ""),
@@ -1812,12 +2044,11 @@ def normalize_store_entry(entry: dict[str, Any]) -> dict[str, Any]:
         validate_reference_doc_path=False,
     )
 
-    normalized_fingerprint = payload_fingerprint(payload)
-    normalized_id = str(entry.get("id") or "").strip() or payload_id(normalized_fingerprint)
+    
+    normalized_id = str(entry.get("id") or "").strip() or generate_memory_id(str(raw_memory_kind))
 
     normalized_entry = {
         "id": normalized_id,
-        "fingerprint": normalized_fingerprint,
         "created_at": normalized_created_at,
         "updated_at": normalized_updated_at,
         **payload,
@@ -1841,6 +2072,8 @@ def validate_update_changes(changes: dict[str, Any]) -> dict[str, Any]:
             raise ValueError(
                 "changes.memory_kind is no longer supported; save a new record with the target type and delete the old one if needed"
             )
+        if field_name == "project_id":
+            raise ValueError("changes.project_id is not supported; project binding is immutable in update")
         if field_name in UPDATE_SYSTEM_FIELDS:
             raise ValueError(f"changes must not contain system field '{field_name}'")
         if field_name not in UPDATE_ALLOWED_FIELDS:
@@ -1859,7 +2092,7 @@ def validate_update_changes(changes: dict[str, Any]) -> dict[str, Any]:
 # 用当前记录和已校验的 update 补丁合成一条候选新记录；上层函数 update_record 保留它，是为了让入口层继续看得见“补丁 -> 重建”主链路。
 def build_update_candidate_record(source_entry: dict[str, Any], changes: dict[str, Any]) -> dict[str, Any]:
     payload_inputs: dict[str, Any] = {}
-    for field_name in UPDATE_ALLOWED_FIELDS:
+    for field_name in get_update_allowed_fields_for_memory_kind(str(source_entry.get("memory_kind") or "")):
         if field_name in changes:
             payload_inputs[field_name] = changes[field_name]
         else:
@@ -1868,21 +2101,22 @@ def build_update_candidate_record(source_entry: dict[str, Any], changes: dict[st
     payload = build_payload(
         memory_kind=str(source_entry.get("memory_kind") or ""),
         title=str(payload_inputs["title"] or ""),
-        detailed_summary=str(payload_inputs["detailed_summary"] or ""),
+        detailed_summary=str(payload_inputs.get("detailed_summary") or source_entry.get("detailed_summary") or ""),
         short_summary=payload_inputs.get("short_summary"),
+        overview_summary=payload_inputs.get("overview_summary"),
         problem_background=payload_inputs.get("problem_background"),
         analysis=payload_inputs.get("analysis"),
         action_steps=payload_inputs.get("action_steps"),
         validation_result=payload_inputs.get("validation_result"),
+        project_id=source_entry.get("project_id"),
         tags=payload_inputs.get("tags"),
         source_paths=payload_inputs.get("source_paths"),
         reference_doc_path=payload_inputs.get("reference_doc_path"),
     )
-    normalized_fingerprint = payload_fingerprint(payload)
+    
 
     return {
         "id": str(source_entry.get("id") or "").strip(),
-        "fingerprint": normalized_fingerprint,
         "created_at": str(source_entry.get("created_at") or "").strip(),
         "updated_at": str(source_entry.get("updated_at") or "").strip(),
         **payload,
@@ -1900,7 +2134,7 @@ def build_field_record_entries(source_entry: dict[str, Any]) -> list[dict[str, A
         raise ValueError("field_record source entry must have a non-empty id")
 
     field_entries: list[dict[str, Any]] = []
-    for field_name in FIELD_RECORD_CANDIDATE_FIELDS:
+    for field_name in get_field_record_candidate_fields_for_memory_kind(str(source_entry.get("memory_kind") or "")):
         field_entry = build_field_record_entry_for_field(source_entry, field_name)
         if field_entry is not None:
             field_entries.append(field_entry)
@@ -1938,13 +2172,22 @@ def plan_field_record_delta(
     candidate_field_names = {
         field_name
         for field_name in normalized_touched_fields
-        if field_name in FIELD_RECORD_CANDIDATE_FIELDS
+        if field_name in set(get_field_record_candidate_fields_for_memory_kind(str(updated_entry.get("memory_kind") or "")))
+        or field_name in set(get_field_record_candidate_fields_for_memory_kind(str(previous_entry.get("memory_kind") or "")))
     }
 
     ordered_candidate_fields = [
-        field_name
-        for field_name in FIELD_RECORD_CANDIDATE_FIELDS
-        if field_name in candidate_field_names
+        *[
+            field_name
+            for field_name in get_field_record_candidate_fields_for_memory_kind(str(previous_entry.get("memory_kind") or ""))
+            if field_name in candidate_field_names
+        ],
+        *[
+            field_name
+            for field_name in get_field_record_candidate_fields_for_memory_kind(str(updated_entry.get("memory_kind") or ""))
+            if field_name in candidate_field_names
+            and field_name not in get_field_record_candidate_fields_for_memory_kind(str(previous_entry.get("memory_kind") or ""))
+        ],
     ]
     delta_plan = {
         "unchanged_fields": set(),
@@ -1965,14 +2208,10 @@ def plan_field_record_delta(
         if previous_field_entry is None and updated_field_entry is None:
             delta_plan["unchanged_fields"].add(field_name)
             continue
-        if (
-            previous_field_entry is not None
-            and updated_field_entry is not None
-            and str(previous_field_entry.get("fingerprint") or "").strip()
-            == str(updated_field_entry.get("fingerprint") or "").strip()
-        ):
-            delta_plan["unchanged_fields"].add(field_name)
-            continue
+        if previous_field_entry is not None and updated_field_entry is not None:
+            if field_name not in normalized_touched_fields:
+                delta_plan["unchanged_fields"].add(field_name)
+                continue
         if previous_field_entry is None and updated_field_entry is not None:
             delta_plan["created_fields"].add(field_name)
             delta_plan["fields_to_upsert"].append(field_name)
@@ -2446,12 +2685,12 @@ def resolve_embed_device() -> str:
     return EMBED_DEVICE
 
 
-# 为当前模型目录生成稳定的内容指纹;
-# save/update 的缓存复用判断、search 的索引一致性校验和 meta 写盘都会用到它;
-def build_model_fingerprint(model_path: str) -> str:
+# 为当前 embedding 模型目录生成稳定的身份摘要；
+# save/update 的缓存复用判断、search 的索引一致性校验和 meta 写盘都会用到它。
+def build_embedding_model_fingerprint(model_path: str) -> str:
     normalized_model_path = str(model_path or "").strip()
     if not normalized_model_path:
-        raise RuntimeError("Embedding model path must not be empty when building model_fingerprint.")
+        raise RuntimeError("Embedding model path must not be empty when building embedding_model_fingerprint.")
 
     model_dir = Path(normalized_model_path)
     if not model_dir.is_dir():
@@ -2529,7 +2768,7 @@ def build_store_entry_map(entries: list[dict[str, Any]]) -> dict[str, dict[str, 
     }
 
 
-# 清洗详情接口传入的 ids，去掉空白项、按首次出现顺序去重，并保证最终列表非空。
+# 清洗详情接口传入的 ids，去掉空白项、按首次出现顺序折叠重复项，并保证最终列表非空。
 def normalize_record_ids(record_ids: list[str] | None) -> list[str]:
     normalized_ids: list[str] = []
     seen_ids: set[str] = set()
@@ -2549,19 +2788,19 @@ def normalize_record_ids(record_ids: list[str] | None) -> list[str]:
 # update_store_and_rebuild / rebuild_vector_index 会先确定当前整库记录顺序，
 # 再由 rebuild_index_from_embeddings 把这份顺序传进来。
 # 这里的 model_path 只用于写入给人看的 meta["model"]，方便排查当前索引当时用了哪个模型目录，
-# 它不再参与机器判断；真正给程序比对模型身份的是 model_fingerprint。
+# 它不再参与机器判断；真正给程序比对模型身份的是 embedding_model_fingerprint。
 # dim 也不是配置常量，而是这次实际写盘的 embedding 矩阵列数，所以继续由上游按当前结果传进来。
 # retrieval_field_signature 则继续直接使用模块级常量 RETRIEVAL_FIELD_SIGNATURE，
 # 因为它来自启动时读取的 retrieval.field_candidates，表示当前代码这套检索字段拼接规则。
 def write_vector_meta(
     entry_ids: list[str],
     model_path: str,
-    model_fingerprint: str,
+    embedding_model_fingerprint: str,
     dim: int,
 ) -> None:
     meta = {
         "model": model_path,
-        "model_fingerprint": model_fingerprint,
+        "embedding_model_fingerprint": embedding_model_fingerprint,
         "dim": int(dim),
         "normalized": True,
         "retrieval_field_signature": RETRIEVAL_FIELD_SIGNATURE,
@@ -2572,11 +2811,11 @@ def write_vector_meta(
 
 # 校验并读取（若校验通过）当前仍可复用的本地向量缓存和 meta 索引。
 # 上层函数 update_store_and_rebuild() 会在 save / delete 接口的快路径里优先走这里，来判断旧缓存还能不能继续复用。
-# 这里要求调用方传入“本次请求最终选中的模型目录”对应的 model_fingerprint，
+# 这里要求调用方传入“本次请求最终选中的模型目录”对应的 embedding_model_fingerprint，
 # 因为模型身份属于这次请求上下文，不应该在这个下层函数里再重复扫描模型目录生成一次。
 # retrieval_field_signature 继续直接读取模块级常量 RETRIEVAL_FIELD_SIGNATURE，
 # 因为它代表的是当前代码的字段拼接规则，不是每次请求单独生成的数据。
-def load_reusable_embedding_cache(model_fingerprint: str) -> tuple[np.ndarray, list[str]] | None:
+def load_reusable_embedding_cache(embedding_model_fingerprint: str) -> tuple[np.ndarray, list[str]] | None:
     if not EMBEDDINGS_PATH.exists() or not META_PATH.exists():
         return None
 
@@ -2597,7 +2836,7 @@ def load_reusable_embedding_cache(model_fingerprint: str) -> tuple[np.ndarray, l
 
     if not isinstance(meta, dict):
         return None
-    if str(meta.get("model_fingerprint") or "").strip() != str(model_fingerprint or "").strip():
+    if str(meta.get("embedding_model_fingerprint") or "").strip() != str(embedding_model_fingerprint or "").strip():
         return None
     if str(meta.get("retrieval_field_signature") or "") != RETRIEVAL_FIELD_SIGNATURE:
         return None
@@ -2622,13 +2861,13 @@ def load_reusable_embedding_cache(model_fingerprint: str) -> tuple[np.ndarray, l
 
 # update_store_and_rebuild、rebuild_vector_index 和增量缓存路径都通过这里把向量缓存与索引产物同步写盘。
 # 这个函数只负责把“已经准备好的向量矩阵”和“已经确定好的模型身份信息”落成 .npy / .faiss / meta 三份产物。
-# 它不会再自己生成 model_fingerprint；dim 也直接从当前 embeddings 的列数计算，
+# 它不会再自己生成 embedding_model_fingerprint；dim 也直接从当前 embeddings 的列数计算，
 # 因为 dim 属于这次写盘结果，不适合提成服务级静态变量。
 def rebuild_index_from_embeddings(
     entry_ids: list[str],
     embeddings: np.ndarray,
     model_path: str,
-    model_fingerprint: str,
+    embedding_model_fingerprint: str,
 ) -> dict[str, Any]:
     if not entry_ids:
         for artifact_path in (EMBEDDINGS_PATH, INDEX_PATH, META_PATH):
@@ -2647,7 +2886,7 @@ def rebuild_index_from_embeddings(
     index = faiss.IndexFlatIP(dim)
     index.add(normalized_embeddings)
     faiss.write_index(index, str(INDEX_PATH))
-    write_vector_meta(entry_ids, model_path, model_fingerprint, dim)
+    write_vector_meta(entry_ids, model_path, embedding_model_fingerprint, dim)
     return {"count": len(entry_ids), "dim": dim}
 
 
@@ -2659,7 +2898,7 @@ def rebuild_vector_index(
     model_path: str | None = None,
 ) -> dict[str, Any]:
     resolved_model_path = model_path or resolve_embed_model_path()
-    current_model_fingerprint = build_model_fingerprint(resolved_model_path)
+    current_embedding_model_fingerprint = build_embedding_model_fingerprint(resolved_model_path)
     if entries is None:
         ordered_entry_ids: list[str] = []
         embedding_batches: list[np.ndarray] = []
@@ -2684,21 +2923,21 @@ def rebuild_vector_index(
                 [],
                 np.empty((0, 0), dtype="float32"),
                 resolved_model_path,
-                current_model_fingerprint,
+                current_embedding_model_fingerprint
             )
         rebuilt_embeddings = np.vstack(embedding_batches).astype("float32")
         return rebuild_index_from_embeddings(
             ordered_entry_ids,
             rebuilt_embeddings,
             resolved_model_path,
-            current_model_fingerprint,
+            current_embedding_model_fingerprint
         )
     if not entries:
         return rebuild_index_from_embeddings(
             [],
             np.empty((0, 0), dtype="float32"),
             resolved_model_path,
-            current_model_fingerprint,
+            current_embedding_model_fingerprint
         )
 
     resolved_embedder = embedder or get_embedder(resolved_model_path, resolve_embed_device())
@@ -2709,7 +2948,7 @@ def rebuild_vector_index(
         [str(entry.get("id") or "").strip() for entry in sorted_entries],
         embeddings,
         resolved_model_path,
-        current_model_fingerprint,
+        current_embedding_model_fingerprint
     )
 
 
@@ -2811,7 +3050,7 @@ def update_store_and_rebuild(
     write_text_atomic(TIMELINE_PATH, build_timeline_markdown_from_batches(iter_public_entries_for_timeline()))
     # 获取模型目录
     resolved_model_path = model_path or resolve_embed_model_path()
-    current_model_fingerprint = build_model_fingerprint(resolved_model_path)
+    current_embedding_model_fingerprint = build_embedding_model_fingerprint(resolved_model_path)
 
     # 开始更新后续的 .npy / .faiss / meta 文件。
     if not current_entry_ids:  # 如果主数据列表为空，则清空embedding 缓存、FAISS 和 meta
@@ -2820,7 +3059,7 @@ def update_store_and_rebuild(
             [],
             np.empty((0, 0), dtype="float32"),
             resolved_model_path,
-            current_model_fingerprint,
+            current_embedding_model_fingerprint
         )
         write_rebuild_state(
             build_rebuild_state_snapshot(
@@ -2836,7 +3075,7 @@ def update_store_and_rebuild(
         #   1. 已经算好的向量矩阵（numpy）
         #   2. 向量矩阵每一行对应的记录 id 顺序（row-to-id）
         # 后续 新增 / 删除 分支都会优先复用这份缓存。
-        cached_embedding_state = load_reusable_embedding_cache(current_model_fingerprint)
+        cached_embedding_state = load_reusable_embedding_cache(current_embedding_model_fingerprint)
 
         # save 的增量路径（当新增记录时执行的代码）：
         #   1. 只对新增记录生成 retrieval_text 并做一次 embedding
@@ -2892,7 +3131,7 @@ def update_store_and_rebuild(
                     current_entry_ids,
                     rebuilt_embeddings,
                     resolved_model_path,
-                    current_model_fingerprint,
+                    current_embedding_model_fingerprint
                 )
             else:
                 # 只要新增快路径的前提不再安全，就回退到完整重建，
@@ -2933,7 +3172,7 @@ def update_store_and_rebuild(
                     current_entry_ids,
                     rebuilt_embeddings,
                     resolved_model_path,
-                    current_model_fingerprint,
+                    current_embedding_model_fingerprint
                 )
             else:
                 # 如果旧缓存和当前删除结果对不上，就退回全量重建，
@@ -2988,7 +3227,7 @@ def update_store_and_rebuild(
                     current_entry_ids,
                     rebuilt_embeddings,
                     resolved_model_path,
-                    current_model_fingerprint,
+                    current_embedding_model_fingerprint
                 )
             else:
                 # 只要当前缓存无法证明“除了这次更新家族外，其余记录都还能直接复用旧向量”，

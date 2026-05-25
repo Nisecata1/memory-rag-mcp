@@ -33,6 +33,7 @@ memory:
     - project_record
     - chat_event
     - fact
+    - project_registry
     - field_record
 
 # 摘要与标签生成相关配置。
@@ -58,6 +59,7 @@ retrieval:
   field_labels: # 检索文本拼接时使用的人类可读标签名。
     title: 标题
     short_summary: 简短摘要
+    overview_summary: 项目概述
     problem_background: 问题背景
     analysis: 分析
     action_steps: 步骤
@@ -75,6 +77,8 @@ results:
     - created_at
     - title
     - short_summary
+    - overview_summary
+    - project_id
     - tags
     - reference_doc_path
   detail_fields: # 详情接口默认返回的完整业务字段。
@@ -84,14 +88,13 @@ results:
     - memory_kind
     - title
     - short_summary
+    - overview_summary
     - problem_background
     - analysis
     - action_steps
     - validation_result
     - detailed_summary
+    - project_id
     - tags
     - source_paths
     - reference_doc_path
-  debug_fields: # 仅在调试模式下返回的内部字段。
-    - fingerprint
-    - retrieval_fields
