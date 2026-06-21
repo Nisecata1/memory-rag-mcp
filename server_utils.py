@@ -1322,14 +1322,19 @@ def fetch_entry_family_by_source_ids(source_ids: set[str]) -> list[dict[str, Any
     return sort_entries(family_entries)
 
 
-# 读取当前整库的稳定顺序 id 列表；增量向量拼接只需要这一列，不需要把整条主数据都搬进内存。
+# 读取当前整库里真正进入向量索引的稳定顺序 id 列表；空检索文本记录会在这里被排除。
 def fetch_ordered_store_entry_ids() -> list[str]:
     ensure_sqlite_store_ready()
     with closing(get_sqlite_connection()) as connection:
         rows = connection.execute(
-            f"SELECT id FROM {ALL_MEMORY_VIEW} ORDER BY {SQLITE_ENTRY_ORDER_BY}"
+            f"""
+            SELECT {', '.join(SQLITE_ENTRY_COLUMNS)}, source_field_value_text, source_field_value_json
+            FROM {ALL_MEMORY_VIEW}
+            ORDER BY {SQLITE_ENTRY_ORDER_BY}
+            """
         ).fetchall()
-    return [str(row["id"] or "").strip() for row in rows if str(row["id"] or "").strip()]
+    ordered_entries = [build_entry_from_sqlite_row(row) for row in rows]
+    return [entry_id for entry_id, _, _ in build_indexable_entry_payloads(ordered_entries)]
 
 
 # 统计当前公开主记忆条数；对外 total_entries 不把 field_record 算进去。
@@ -1615,9 +1620,10 @@ def get_retrieval_field_candidates_for_memory_kind(memory_kind: str) -> tuple[st
     return tuple(RETRIEVAL_FIELD_CANDIDATES)
 
 
-# 生成项目注册表的稳定 id；create_project 会先调这里拿到 proj- 前缀 id，再把它写进 project_registry 和 memory_registry。
+# 生成项目注册表的稳定 id；create_project 会先调这里拿到 projRegId- 前缀 id，
+# 再把它同时写进 project_registry.id、project_id 和 memory_registry，旧 proj-* / projRegisterMemId-* 继续只作为历史兼容格式保留。
 def build_project_id() -> str:
-    return f"proj-{hashlib.sha256(f'{now_iso()}|{time.time_ns()}'.encode('utf-8')).hexdigest()[:12]}"
+    return f"projRegId-{hashlib.sha256(f'{now_iso()}|{time.time_ns()}'.encode('utf-8')).hexdigest()[:12]}"
 
 
 # 从整库记录里筛出对外可见的主记忆；它服务于时间线、search 折叠回源、total_entries 统计等链路。
@@ -1746,6 +1752,8 @@ def build_one_hot_field_record_entry(
         "source_paths": [],
         "reference_doc_path": "",
         "retrieval_fields": [source_field_name],
+        "source_field_value_text": render_field_record_value_text(field_value),
+        "source_field_value_json": dump_field_record_value_json(field_value),
     }
     payload[source_field_name] = list(field_value) if isinstance(field_value, list) else field_value
     
@@ -1857,6 +1865,21 @@ def build_retrieval_text(entry: dict[str, Any]) -> str:
             continue
         parts.append(f"{FIELD_LABELS[field_name]}：{rendered}")
     return "\n".join(parts)
+
+
+# 统一筛出真正允许进入向量索引的记录，并把 id / 原记录 / 检索文本绑定在一起。
+# rebuild_vector_index 和 update_store_and_rebuild 都通过这里决定谁能写进 row_to_id，避免矩阵行数和 id 顺序错位。
+def build_indexable_entry_payloads(entries: list[dict[str, Any]]) -> list[tuple[str, dict[str, Any], str]]:
+    payloads: list[tuple[str, dict[str, Any], str]] = []
+    for entry in entries:
+        entry_id = str(entry.get("id") or "").strip()
+        if not entry_id:
+            continue
+        retrieval_text = build_retrieval_text(entry)
+        if not collapse_text(retrieval_text):
+            continue
+        payloads.append((entry_id, entry, retrieval_text))
+    return payloads
 
 
 # 根据结果或详细总结生成适合时间线显示的单行预览，避免 Markdown 视图过长。
@@ -2904,17 +2927,14 @@ def rebuild_vector_index(
         embedding_batches: list[np.ndarray] = []
         resolved_embedder = embedder
         for entry_batch in iter_store_entries_in_batches():
+            indexable_payloads = build_indexable_entry_payloads(entry_batch)
+            if not indexable_payloads:
+                continue
             if resolved_embedder is None:
                 resolved_embedder = get_embedder(resolved_model_path, resolve_embed_device())
-            ordered_entry_ids.extend(
-                [
-                    str(entry.get("id") or "").strip()
-                    for entry in entry_batch
-                    if str(entry.get("id") or "").strip()
-                ]
-            )
+            ordered_entry_ids.extend([entry_id for entry_id, _, _ in indexable_payloads])
             batch_embeddings = encode_texts(
-                [build_retrieval_text(entry) for entry in entry_batch],
+                [retrieval_text for _, _, retrieval_text in indexable_payloads],
                 resolved_embedder,
             )
             embedding_batches.append(batch_embeddings)
@@ -2942,10 +2962,20 @@ def rebuild_vector_index(
 
     resolved_embedder = embedder or get_embedder(resolved_model_path, resolve_embed_device())
     sorted_entries = sort_entries(entries)
-    retrieval_texts = [build_retrieval_text(entry) for entry in sorted_entries]
-    embeddings = encode_texts(retrieval_texts, resolved_embedder)
+    indexable_payloads = build_indexable_entry_payloads(sorted_entries)
+    if not indexable_payloads:
+        return rebuild_index_from_embeddings(
+            [],
+            np.empty((0, 0), dtype="float32"),
+            resolved_model_path,
+            current_embedding_model_fingerprint
+        )
+    embeddings = encode_texts(
+        [retrieval_text for _, _, retrieval_text in indexable_payloads],
+        resolved_embedder,
+    )
     return rebuild_index_from_embeddings(
-        [str(entry.get("id") or "").strip() for entry in sorted_entries],
+        [entry_id for entry_id, _, _ in indexable_payloads],
         embeddings,
         resolved_model_path,
         current_embedding_model_fingerprint
@@ -3113,26 +3143,33 @@ def update_store_and_rebuild(
                 # 调用 embedding 模型对新增的这一条记录做编码
                 resolved_embedder = embedder or get_embedder(resolved_model_path, resolve_embed_device())
                 new_entries = fetch_store_entries_by_ids(new_entry_ids)
-                new_embeddings = encode_texts(
-                    [build_retrieval_text(entry) for entry in new_entries],
-                    resolved_embedder,
-                )
-                # 把新记录向量补进 "id -> 向量" 字典后，旧记录和新记录的向量就都齐了。
-                for index, entry in enumerate(new_entries):
-                    entry_id = str(entry.get("id") or "").strip()
-                    cached_vector_by_id[entry_id] = new_embeddings[index]
-                # 按“当前最新整库顺序”从字典里把向量重新取出来，拼成一份新的完整矩阵。
-                # 这里重拼的是矩阵顺序，不是重新计算旧记录的 embedding。
-                rebuilt_embeddings = np.vstack(
-                    [cached_vector_by_id[entry_id] for entry_id in current_entry_ids]
-                ).astype("float32")
-                # 用这份新矩阵统一重写 .npy、.faiss 和 meta。
-                rebuild_stats = rebuild_index_from_embeddings(
-                    current_entry_ids,
-                    rebuilt_embeddings,
-                    resolved_model_path,
-                    current_embedding_model_fingerprint
-                )
+                new_entry_payloads = build_indexable_entry_payloads(new_entries)
+                if len(new_entry_payloads) != len(new_entry_ids):
+                    background_rebuild_notice = launch_background_full_rebuild(
+                        resolved_model_path,
+                        len(current_entry_ids),
+                    )
+                    rebuild_stats = load_current_index_stats()
+                else:
+                    new_embeddings = encode_texts(
+                        [retrieval_text for _, _, retrieval_text in new_entry_payloads],
+                        resolved_embedder,
+                    )
+                    # 把新记录向量补进 "id -> 向量" 字典后，旧记录和新记录的向量就都齐了。
+                    for index, (entry_id, _, _) in enumerate(new_entry_payloads):
+                        cached_vector_by_id[entry_id] = new_embeddings[index]
+                    # 按“当前最新整库顺序”从字典里把向量重新取出来，拼成一份新的完整矩阵。
+                    # 这里重拼的是矩阵顺序，不是重新计算旧记录的 embedding。
+                    rebuilt_embeddings = np.vstack(
+                        [cached_vector_by_id[entry_id] for entry_id in current_entry_ids]
+                    ).astype("float32")
+                    # 用这份新矩阵统一重写 .npy、.faiss 和 meta。
+                    rebuild_stats = rebuild_index_from_embeddings(
+                        current_entry_ids,
+                        rebuilt_embeddings,
+                        resolved_model_path,
+                        current_embedding_model_fingerprint
+                    )
             else:
                 # 只要新增快路径的前提不再安全，就回退到完整重建，
                 # 但这轮不再把全量 embedding 堵在前台请求里，而是改成后台慢任务继续补齐索引。
@@ -3157,10 +3194,11 @@ def update_store_and_rebuild(
             }
             # current_entry_ids 代表“删除完成后，当前整库还剩哪些记录，以及它们现在的顺序”。
             # 删除快路径的安全条件是：
-            # 1. 所有待删 id 都必须能在旧缓存里找到；
-            # 2. 删除后还保留的每个 id，也都必须能在旧缓存里找到。
-            # 满足这两个条件，就可以直接复用旧向量，不需要重新调用 embedding 模型。
-            if all(deleted_id in cached_vector_by_id for deleted_id in deleted_id_set) and all(
+            # 1. 删除后还保留、且仍应在索引里的每个 id，都必须能在旧缓存里找到。
+            # 已删除但本来就不在索引里的空文本记录，不应该逼迫整库退回全量重建。
+            for deleted_id in deleted_id_set:
+                cached_vector_by_id.pop(deleted_id, None)
+            if all(
                 entry_id and entry_id in cached_vector_by_id for entry_id in current_entry_ids
             ):
                 # 直接按删除后的最新顺序把剩余向量重拼成新矩阵。
@@ -3197,29 +3235,22 @@ def update_store_and_rebuild(
                 if str(record_id or "").strip()
             ]
             reencoded_entries = [normalized_updated_entry, *updated_field_record_entries_for_vector]
-            reencoded_entry_id_set = {
-                str(entry.get("id") or "").strip()
-                for entry in reencoded_entries
-                if str(entry.get("id") or "").strip()
-            }
-            if (
-                reencoded_entry_id_set
-                and all(removed_id in cached_vector_by_id for removed_id in removed_field_record_ids)
-                and all(
-                    entry_id and (entry_id in cached_vector_by_id or entry_id in reencoded_entry_id_set)
-                    for entry_id in current_entry_ids
-                )
+            reencoded_entry_payloads = build_indexable_entry_payloads(reencoded_entries)
+            reencoded_entry_id_set = {entry_id for entry_id, _, _ in reencoded_entry_payloads}
+            for removed_id in removed_field_record_ids:
+                cached_vector_by_id.pop(removed_id, None)
+            if all(
+                entry_id and (entry_id in cached_vector_by_id or entry_id in reencoded_entry_id_set)
+                for entry_id in current_entry_ids
             ):
-                for removed_id in removed_field_record_ids:
-                    cached_vector_by_id.pop(removed_id, None)
-                resolved_embedder = embedder or get_embedder(resolved_model_path, resolve_embed_device())
-                updated_embeddings = encode_texts(
-                    [build_retrieval_text(entry) for entry in reencoded_entries],
-                    resolved_embedder,
-                )
-                for index, entry in enumerate(reencoded_entries):
-                    entry_id = str(entry.get("id") or "").strip()
-                    cached_vector_by_id[entry_id] = updated_embeddings[index]
+                if reencoded_entry_payloads:
+                    resolved_embedder = embedder or get_embedder(resolved_model_path, resolve_embed_device())
+                    updated_embeddings = encode_texts(
+                        [retrieval_text for _, _, retrieval_text in reencoded_entry_payloads],
+                        resolved_embedder,
+                    )
+                    for index, (entry_id, _, _) in enumerate(reencoded_entry_payloads):
+                        cached_vector_by_id[entry_id] = updated_embeddings[index]
                 rebuilt_embeddings = np.vstack(
                     [cached_vector_by_id[entry_id] for entry_id in current_entry_ids]
                 ).astype("float32")
