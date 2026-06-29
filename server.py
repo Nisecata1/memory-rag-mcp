@@ -480,6 +480,7 @@ def update_record(
 
 
 # 显式创建一条 project_registry 项目摘要；这里先挡住同名项目，再把项目摘要作为新的可检索主记忆写入统一索引。
+# create_project 生成的新项目注册 id 统一使用 projRegId-*；这条记录自己的 id 继续直接等于 project_id。
 def create_project_record(
     title: str,
     overview_summary: str,
@@ -514,6 +515,7 @@ def create_project_record(
 
 
 # 向一个已存在 project_id 下面追加一条共享 project_record；这里先校验项目是否存在，再复用现有 save 增量刷新路径。
+# 这里不看 project_id 前缀，只要能查到 project_registry 就允许挂接，所以旧 proj-* / projRegisterMemId-* 项目会长期兼容。
 def save_project_record(
     project_id: str,
     title: str,
@@ -748,6 +750,7 @@ def save_chatEvent(
     description=(
         "显式创建一条新的项目摘要记忆。"
         "这个接口固定把记录类型写成 project_registry，并自动生成 project_id。"
+        "新创建的 project_id 格式固定为 projRegId-*。"
         "project_id 只用于聚合同项目的具体问题记录和项目摘要，不参与 embedding 文本。"
         "项目摘要会进入向量库，也会生成自己的 field_record。"
         "正式入库内容只应包含已验证的事实、用户明确实践过的操作，或能被文件、截图、日志、命令输出直接证明的结论；不要把未验证的推测、归因或建议写成正式记忆。"
@@ -807,6 +810,7 @@ def create_project(
     description=(
         "向一个已存在 project_id 的项目下保存一条新的 project_record。"
         "这个接口不会隐式创建项目；调用方必须先 create_project，再拿返回的 project_id 继续写项目问题。"
+        "save_project 自己生成的记录 id 固定是 projMemId-*，传入的 project_id 则继续兼容旧 proj-* / projRegisterMemId-*。"
         "project_id 只负责把同项目的具体问题记录聚到一起，不参与 embedding 文本。"
         "正式入库内容只应包含已验证的事实、用户明确实践过的操作，或能被文件、截图、日志、命令输出直接证明的结论；不要把未验证的推测、归因或建议写成正式记忆。"
     ),
@@ -814,7 +818,7 @@ def create_project(
 def save_project(
     project_id: Annotated[
         str,
-        Field(description="必填。已存在的 project_id；只有 project_registry 里存在的 id 才允许挂接项目问题。"),
+        Field(description="必填。已存在的 project_id；只有 project_registry 里存在的 id 才允许挂接项目问题。新项目通常是 projRegId-*，旧 proj-* / projRegisterMemId-* 也继续兼容。"),
     ],
     title: Annotated[
         str,

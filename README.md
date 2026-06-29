@@ -22,7 +22,7 @@
 **field_record 内部记忆类型**
 该记忆类型不作为返回，仅为了提升召回，在 save 时由服务端自动拆分记忆的每个字段分别存储一遍，并且 search 调用时不会返回给用户
 **目的**：为了解决**粒度不一致**的问题（比如单条记忆太大 quary 太小）导致检索漏关键信息
-**字段描述**：在每一条记忆详细入库之后，也顺便把该条记忆中真正参与拆分的字段单独存成`field_record`。当前物理表只保留 `source_memory_id`、`source_field_name`、字段值文、字段值 JSON、指纹和时间等最小必要字段。
+**字段描述**：在每一条记忆详细入库之后，也顺便把该条记忆中真正参与拆分的字段单独存成`field_record`。当前物理表只保留 `source_memory_id`、`source_field_name`、`source_field_value_text`、`source_field_value_json`、`created_at`、`updated_at` 这些最小必要字段。
 
 **本地 embedding 缓存和增量更新**
 在性能上重点做了“少重复 embedding”。这里具体指：优先走本地 embedding 缓存和增量更新，只有缓存失效或条件不满足时才退回后台全量重建。
@@ -41,6 +41,7 @@ project_registry 真正参与检索文本的字段固定为：
 - overview_summary
 - tags
 project_id 不进检索文本。
+这里具体指：新创建的 `project_registry.id` / `project_id` 统一用 `projRegId-*`；历史上的 `proj-*`、`projRegisterMemId-*` 仍然允许继续被 `save_project` 挂载。
 created_at、updated_at、reference_doc_path、source_paths 不进检索文本，避免时间和路径噪声污染召回。
 project_registry 不再要求调用方传 short_summary；如果统一返回结构仍需要 short_summary，就在服务端基于 overview_summary 自动生成一个兼容值，不单独落库。
 (待优化，返回结构不应该由接口限制，毕竟记忆的字段都已经是服务端定好的，遵循严入宽出的原则)
@@ -257,6 +258,7 @@ project_registry 不再要求调用方传 short_summary；如果统一返回结�
 
 - `id`
   - 本条记录的稳定唯一标识。
+  - `project_registry` 新记录使用 `projRegId-*`；历史兼容格式还有 `proj-*`、`projRegisterMemId-*`；`project_record` 使用 `projMemId-*`。
 - `updated_at`
   - 最近一次入库或更新的时间。
 - `created_at`
@@ -343,7 +345,7 @@ save：先规范化新记录，读老主数据进内存，然后拼接成新主�
 然后脚本根据这个 dict 以及新主数据的 id 顺序（current_entry_ids ），按最新顺序重拼并落盘新faiss、meta和npy：  
 memory_embeddings.npy <- rebuilt_embeddings  
 memory.faiss <- 基于 rebuilt_embeddings 重建  
-meta_NpyRow-to-id.json <- sorted_entries 的 id 顺序
+meta_NpyRow-to-id.json <- sorted_entries 中真正有检索文本的 id 顺序
 这个 meta 文件里还会保存 `embedding_model_fingerprint`，只用于校验当前索引是不是由同一个 embedding 模型目录生成。  
 
 ## `save_chatEvent` 接口
@@ -644,6 +646,7 @@ meta_NpyRow-to-id.json <- sorted_entries 的 id 顺序
 - 当前索引链路已经分成四层：`SQLite` 主数据、embedding 缓存矩阵、FAISS 索引、meta 映射；优化重点是减少重复 embedding，而不是完全不重建 FAISS。
 - `fact` 走同库新类型，不单独建第二套 store/index；当前版本不做自动提纯或自动分片。
 - `field_record` 现在按 one-hot 形态存储：`source_field_name` 是什么，就只让那个字段非空；向量化时也只取该字段原值，不再混入额外摘要壳。
+- 当前只有真正能拼出检索文本的记录才会进入 `memory_embeddings.npy`、`memory.faiss` 和 `meta_NpyRow-to-id.json`；空检索文本记录会被排除，避免把无意义空向量写进索引。
 - `field_record` 会跟随主记忆自动生成、同步和删除，但不会进入时间线，也不会计入对外展示的 `total_entries`。
 - 向量加载和归一化逻辑在当前目录下的 `embedding_utils.py` 中，不再依赖其他项目文件。
 
