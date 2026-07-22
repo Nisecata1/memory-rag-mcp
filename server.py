@@ -23,7 +23,6 @@ if str(CURRENT_DIR) not in sys.path:
 
 # 导入 server_utils 中的底层函数
 from server_utils import (
-    DETAIL_RESULT_FIELDS,
     INDEX_PATH,
     MATCHED_FIELDS_LIMIT,
     MAX_TOP_K,
@@ -40,7 +39,9 @@ from server_utils import (
     build_update_candidate_record,
     count_public_store_entries,
     encode_texts,
+    ensure_sqlite_store_ready,
     ensure_write_operations_allowed,
+    fetch_detail_records_by_ids,
     fetch_entry_family_by_source_ids,
     fetch_public_timeline_summary_entries,
     fetch_project_registry_entry_by_title,
@@ -71,11 +72,10 @@ server = FastMCP(
     ),
 )
 
-# 按多条记录 id 回源主数据并返回完整详情记忆；保留在本文件是为了让“接口 -> 主数据回源 -> 结果裁剪”的链路仍能在入口层直接看清。
-# 这里直接按 id 查 SQLite 主数据，不碰 meta。
+# 按多条记录 id 回源主数据并返回类型化详情；这里直接调用物理表读取链路，不碰 meta 或统一公共视图。
 def get_detail_records_by_ids(record_ids: list[str]) -> dict[str, Any]:
     normalized_ids = normalize_record_ids(record_ids)
-    fetched_entries = fetch_store_entries_by_ids(normalized_ids)
+    fetched_entries = fetch_detail_records_by_ids(normalized_ids)
     store_entry_map = {
         str(entry.get("id") or "").strip(): entry
         for entry in fetched_entries
@@ -88,14 +88,7 @@ def get_detail_records_by_ids(record_ids: list[str]) -> dict[str, Any]:
         if source_entry is None:
             missing_ids.append(normalized_record_id)
             continue
-        if is_field_record_entry(source_entry):
-            raise ValueError(f"field_record is an internal index asset and cannot be read directly: {normalized_record_id}")
-        # 详情读取链路直接在这里裁剪主数据字段，避免再跳一层只服务本函数的包装函数。
-        result = {
-            field_name: source_entry.get(field_name)
-            for field_name in DETAIL_RESULT_FIELDS
-        }
-        records.append(result)
+        records.append(source_entry)
 
     return {
         "ids": normalized_ids,
@@ -173,6 +166,7 @@ def search_records(
     if not normalized_query:
         raise ValueError("query is required")
 
+    ensure_sqlite_store_ready()
     # 搜索链路直接在这里读取和校验 meta，避免再绕一层只被本函数使用的包装函数。
     if not META_PATH.exists():
         raise RuntimeError("Vector meta file does not exist yet. Save at least one record first.")
@@ -323,8 +317,9 @@ def search_records(
 def save_record(
     memory_kind: str,
     title: str,
-    detailed_summary: str,
     short_summary: str,
+    detailed_summary: str | None = None,
+    raw_dialogue: str | None = None,
     overview_summary: str | None = None,
     problem_background: str | None = None,
     analysis: str | None = None,
@@ -344,6 +339,7 @@ def save_record(
         title=title,
         detailed_summary=detailed_summary,
         short_summary=short_summary,
+        raw_dialogue=raw_dialogue,
         overview_summary=overview_summary,
         problem_background=problem_background,
         analysis=analysis,
@@ -674,6 +670,7 @@ def save_fact(
     description=(
         "专门用于保存一条会话事件记忆。"
         "这个接口固定把 memory_kind 设为 chat_event。"
+        "raw_dialogue 保存调用方已经去冗余并补齐必要元信息的完整对话，只落 SQLite，不参与向量化。"
         "chat_event 默认按新事件存储，不因为主题相近、人物相近或问题相近，就默认更新旧 chat_event。"
         "只有在补充刚写入不久的同一事件，或纠正原记录事实错误时，才应优先考虑 update 旧 chat_event。"
         "正式入库内容只应包含已验证的事实、用户明确实践过的操作，或能被文件、截图、日志、命令输出直接证明的结论；不要把未验证的推测、归因或建议写成正式记忆。"
@@ -694,13 +691,13 @@ def save_chatEvent(
             ),
         ),
     ],
-    detailed_summary: Annotated[
+    raw_dialogue: Annotated[
         str,
         Field(
             description=(
-                "必填。AI 整理后的最终详细总结，也是正式入库字段。"
-                "如果用户指定了参考文档，这里的信息不能比参考文档更少。"
-                "只允许写入已验证事实、用户明确实践过的操作，或能被文件、截图、日志、命令输出直接证明的结论，不得补写未经验证的推测、归因或建议。"
+                "必填。完整且去冗余的原始对话文本，应包含角色、时间或会话来源等必要元信息。"
+                "服务端只统一换行和清理首尾空白，不自动解析或去重。"
+                "该字段只落 SQLite，并且不会进入 retrieval_fields、field_record 或向量检索文本。"
             )
         ),
     ],
@@ -736,8 +733,8 @@ def save_chatEvent(
     return save_record(
         memory_kind="chat_event",
         title=title,
-        detailed_summary=detailed_summary,
         short_summary=short_summary,
+        raw_dialogue=raw_dialogue,
         tags=tags,
         source_paths=source_paths,
         reference_doc_path=reference_doc_path,
@@ -917,9 +914,10 @@ def update(
         Field(
             description=(
                 "必填。要修改的字段键值对对象，只传要改的业务字段。"
-                "允许字段包括 title、short_summary、overview_summary、detailed_summary、"
+                "允许字段包括 title、short_summary、overview_summary、detailed_summary、raw_dialogue、"
                 "problem_background、analysis、action_steps、validation_result、"
                 "tags、source_paths、reference_doc_path。"
+                "raw_dialogue 只适用于 chat_event，且不能清空；detailed_summary 不再适用于 chat_event。"
                 "传入的业务字段值只应包含已验证事实、用户明确实践过的操作，或能被文件、截图、日志、命令输出直接证明的结论；"
                 "不要把未验证的推测、归因或建议写成更新内容。"
                 "project_id 不允许通过 update 修改。"
@@ -989,6 +987,8 @@ def search(
     name="get_details_by_ids",
     description=(
         "按记录 ids 读取一批项目经验、会话事件或事实记忆的完整详情。"
+        "服务端根据 id 前缀直查对应的 SQLite 物理详情表；未知旧前缀会回查 memory_registry。"
+        "chat_event 会返回 raw_dialogue，但不再返回 detailed_summary。"
         "如果部分 id 不存在，会在 missing_ids 中显式返回。"
     ),
 )
@@ -996,8 +996,8 @@ def get_details_by_ids(
     ids: Annotated[
         list[str],
         Field(
-            description="必填。要读取的记录 id 数组。即使只查一条，也需要传 ids=[\"pmem-xxxx\"]。",
-            json_schema_extra={"examples": [["pmem-123456789abc", "pmem-abcdef123456"]]},
+            description="必填。要读取的记录 id 数组。即使只查一条，也需要传 ids=[\"eventMemId-xxxx\"]。",
+            json_schema_extra={"examples": [["eventMemId-123456789abc", "factMemId-abcdef123456"]]},
         ),
     ],
 ) -> dict[str, Any]:

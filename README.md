@@ -145,7 +145,7 @@ project_registry 不再要求调用方传 short_summary；如果统一返回结�
 
 - 这些接口面向已经整理好的结构化输入，不负责替调用方阅读原始 Markdown、日志或网页。
 - 调用 `save` / `update` 前，应先把内容整理成结构化字段；如果用户指定了现成文档，应先阅读文档，再提取并补充结构化信息。
-- `detailed_summary` 是正式入库字段，不是临时中间值；写进去的内容会直接进入主数据。
+- `project_record` 和 `fact` 使用 `detailed_summary` 作为正式正文；`chat_event` 改用只落 SQLite 的 `raw_dialogue` 保存完整对话。
 - 当前不接受外部传业务时间字段；`created_at` 和 `updated_at` 都由服务端自动维护。
 - `memory.db` 是唯一事实源；向量索引、时间线和内部 `field_record` 都是基于主数据生成的衍生产物。
 - 当前 SQLite 主数据采用分表结构：轻总表负责路由，`project_record / chat_event / fact` 各自有详情表，`field_record` 独立成最小必要字段表。
@@ -183,6 +183,7 @@ project_registry 不再要求调用方传 short_summary；如果统一返回结�
   - `facts`
   - `field_records`
 - 迁移完成后，新代码才会继续正常启动。
+- schema v3 的分表库会在首次访问时自动升级到 v4：为 `chat_events` 增加 `raw_dialogue`，并把旧 `detailed_summary` 原样复制过去。旧物理列保留兼容，但不再属于 `chat_event` 的接口字段。
 
 ## `save` 接口
 
@@ -221,11 +222,15 @@ project_registry 不再要求调用方传 short_summary；如果统一返回结�
   - 这个字段由 AI 主动总结，放在 `retrieval_fields` 的第二位，优先服务于 512 token 预算下的检索命中率。
   - 内容只应来自已验证事实、用户明确实践过的操作，或有直接证据支撑的结论；如果与已有已验证内容相似，优先融合整理，不要重复新编近似说法。
 - `detailed_summary`
-  - 必填。
+  - `project_record` 和 `fact` 必填；`chat_event` 不再接收该字段。
   - AI 整理后的最终详细总结，也是正式入库正文。
   - 这个字段默认不参与 embedding 拼接，主要用于详情阅读和长期归档。
   - 如果用户指定了参考文档，这里的信息不能比参考文档更少。
   - 只允许写入已验证事实、用户明确实践过的操作，或能被文件、截图、日志、命令输出直接证明的结论，不得补写未经验证的推测、归因或建议。
+- `raw_dialogue`
+  - 仅 `chat_event` 必填。
+  - 保存完整且去冗余的原始对话文本，包含角色、时间或会话来源等必要元信息。
+  - 只落 SQLite；不会进入 `retrieval_fields`、`field_record` 或向量检索文本。
 - `problem_background`
   - `project_record` 必填，其他类型可选。
   - 用于保存问题以及背景、故障现象，以及这条已解决问题为什么值得记录；不要写成流水账。
@@ -301,19 +306,22 @@ project_registry 不再要求调用方传 short_summary；如果统一返回结�
   - 必填。
   - 只能是 `project_record`、`chat_event` 或 `fact`。
 - `title`
-  - 两类记忆都必填。
+  - 三类公共记忆都必填。
 - `short_summary`
   - 最终存储必有。
-  - 两类记忆都必填。
+  - 三类公共记忆都必填。
   - 用来保存面向嵌入检索的简短摘要，建议控制在一两句话内。
   - 这个字段需要 AI 主动总结，不再由服务端为新记录自动补造。
 - `detailed_summary`
-  - 两类记忆都必填。
+  - `project_record` 和 `fact` 必填；`chat_event` 不包含该字段。
   - 这是 AI 整理后的最终详细总结，也是正式入库字段。
   - 默认不会进入 embedding 检索文本，主要保留给详情读取和长期归档。
+- `raw_dialogue`
+  - 仅 `chat_event` 必填，用于完整对话回源。
+  - 不参与 embedding，也不会派生 `field_record`。
 - `problem_background`、`analysis`、`action_steps`、`validation_result`
   - `project_record` 必填。
-  - `chat_event` 和 `fact` 可为空；如果传了，也会正常存储并参与检索拼接。
+  - `fact` 可为空；`chat_event` 不再包含这些字段。
   - `problem_background` 用来保存“问题以及背景”，而不只是一个简短问题名。
   - `analysis` 用来保存原因判断、方案分析、排查结论，以及为什么这么做。
   - `action_steps` 用来保存实际执行的步骤、命令、操作顺序或具体处理动作。
@@ -371,12 +379,11 @@ meta_NpyRow-to-id.json <- sorted_entries 中真正有检索文本的 id 顺序
   - 面向嵌入检索的简短摘要，建议控制在一两句话内。
   - 这个字段由 AI 主动总结，放在 `retrieval_fields` 的第二位，优先服务于 512 token 预算下的检索命中率。
   - 内容只应来自已验证事实、用户明确实践过的操作，或有直接证据支撑的结论；如果与已有已验证内容相似，优先融合整理，不要重复新编近似说法。
-- `detailed_summary`
+- `raw_dialogue`
   - 必填。
-  - AI 整理后的最终详细总结，也是正式入库正文。
-  - 这个字段默认不参与 embedding 拼接，主要用于详情阅读和长期归档。
-  - 如果用户指定了参考文档，这里的信息不能比参考文档更少。
-  - 只允许写入已验证事实、用户明确实践过的操作，或能被文件、截图、日志、命令输出直接证明的结论，不得补写未经验证的推测、归因或建议。
+  - 完整且去冗余的原始对话文本，应包含角色、时间或会话来源等必要元信息。
+  - 服务端只统一换行和清理首尾空白，不自动解析或语义去重。
+  - 只落 SQLite，不参与 embedding，也不会生成 `field_record`。
 - `tags`
   - 可选传入，但最终存储必有。
   - 推荐由 AI 先生成标签数组。
@@ -420,6 +427,7 @@ meta_NpyRow-to-id.json <- sorted_entries 中真正有检索文本的 id 顺序
   - 允许字段包括：
     - `title`
     - `short_summary`
+    - `raw_dialogue`（仅 `chat_event`）
     - `detailed_summary`
     - `problem_background`
     - `analysis`
@@ -428,6 +436,7 @@ meta_NpyRow-to-id.json <- sorted_entries 中真正有检索文本的 id 顺序
     - `tags`
     - `source_paths`
     - `reference_doc_path`
+  - `chat_event` 不允许修改 `detailed_summary`；`raw_dialogue` 不能传 `null` 或空字符串清除。
   - 如果需要切换记忆类型，不要把 `memory_kind` 塞进 `changes`；应改为调用 `save` 新建正确类型，再按需要删除旧记录。
   - 不允许直接修改：
     - `id`
@@ -546,6 +555,8 @@ meta_NpyRow-to-id.json <- sorted_entries 中真正有检索文本的 id 顺序
 
 - 用于按记录 `ids` 批量读取项目经验、会话事件或事实记忆的完整详情。
 - 这个接口不做向量搜索，只负责按主键回源主数据。
+- 服务端先根据 id 前缀判断记忆类型，再直接查询对应物理详情表；未知旧前缀会回查 `memory_registry`。
+- 详情读取不经过 `public_memory_view`，也不依赖全局详情字段白名单。
 - 即使只读取一条，也应传单元素数组。
 - 如果部分 id 不存在，接口不会整体报错，而是通过 `missing_ids` 显式返回缺失项。
 - `field_record` 属于内部索引资产，不能通过这个接口直接读取。
@@ -555,7 +566,7 @@ meta_NpyRow-to-id.json <- sorted_entries 中真正有检索文本的 id 顺序
 - `ids`
   - 必填。
   - 要读取的记录 id 数组。
-  - 即使只查一条，也要传 `ids=["pmem-xxxx"]`。
+  - 即使只查一条，也要传 `ids=["eventMemId-xxxx"]`。
   - 通常来自 `search` 结果中的 `id`。
 
 ### 返回字段
@@ -565,21 +576,12 @@ meta_NpyRow-to-id.json <- sorted_entries 中真正有检索文本的 id 顺序
 - `records`
   - 已成功命中的详情记录列表。
   - 顺序与输入 `ids` 保持一致。
-  - 每条记录默认返回完整业务字段：
-    - `id`
-    - `updated_at`
-    - `created_at`
-    - `memory_kind`
-    - `title`
-    - `short_summary`
-    - `problem_background`
-    - `analysis`
-    - `action_steps`
-    - `validation_result`
-    - `detailed_summary`
-    - `tags`
-    - `source_paths`
-    - `reference_doc_path`
+  - 所有类型都返回 `id`、`memory_kind`、`created_at`、`updated_at`，并追加自身物理表对应的业务字段。
+  - `project_record` 返回项目分析、步骤、验证、详细总结及 `project_id` 等项目字段。
+  - `chat_event` 返回 `title`、`short_summary`、`raw_dialogue`、标签和来源字段，不返回 legacy `detailed_summary`。
+  - `fact` 返回 `title`、`short_summary`、`detailed_summary`、标签和来源字段。
+  - `project_registry` 返回 `title`、`overview_summary`、标签和来源字段，并保留 `project_id=id` 的业务别名。
+  - `tags_json`、`source_paths_json` 会转换成 `tags`、`source_paths` 数组；`retrieval_fields_json` 不对外返回。
 - `missing_ids`
   - 本次请求中未找到的 id 列表。
 
@@ -634,15 +636,17 @@ meta_NpyRow-to-id.json <- sorted_entries 中真正有检索文本的 id 顺序
 - `retrieval_fields_json`
   - 这是 `SQLite` 里保存 `retrieval_fields` 的内部列。
   - 它继续参与检索文本拼接和索引刷新，但不会通过 `get_details_by_ids` 对外返回。
-- 当前默认 embedding 字段不包含 `detailed_summary`，而是优先使用 `title`、`short_summary`、`problem_background`、`analysis`、`action_steps`、`validation_result`、`tags`、`reference_doc_path`。
+- 当前默认 embedding 字段不包含 `detailed_summary` 或 `raw_dialogue`，而是优先使用 `title`、`short_summary`、`problem_background`、`analysis`、`action_steps`、`validation_result`、`tags`、`reference_doc_path`。
 
 ## 当前实现特点
 
 - `search` 会先命中 `FAISS`，再回源到 `memory.db` 返回轻量候选字段。
 - 向量索引里同时包含主记忆和内部 `field_record`；`search` 命中 `field_record` 时会折叠回源到主记忆，并用 `matched_fields` 解释命中来源。
 - `get_details_by_ids` 是完整详情的唯一读取入口。
+- `get_details_by_ids` 按 id 类型直查 `project_records`、`chat_events`、`facts` 或 `project_registry`，不经过统一大宽表。
 - `delete_by_ids` 会在主数据删除成功后同步更新时间线，并基于本地 embedding 缓存重建向量索引，不会重复调用 embedding 模型。
-- `detailed_summary` 会保留在主数据里，但默认不进入检索文本，以避免 CPU 全量重建时被长正文拖慢。
+- `project_record` 和 `fact` 的 `detailed_summary` 会保留在主数据里，但默认不进入检索文本。
+- `chat_event.raw_dialogue` 只保存在 SQLite，并且只通过 `get_details_by_ids` 回源，不进入搜索结果或任何向量化链路。
 - 当前索引链路已经分成四层：`SQLite` 主数据、embedding 缓存矩阵、FAISS 索引、meta 映射；优化重点是减少重复 embedding，而不是完全不重建 FAISS。
 - `fact` 走同库新类型，不单独建第二套 store/index；当前版本不做自动提纯或自动分片。
 - `field_record` 现在按 one-hot 形态存储：`source_field_name` 是什么，就只让那个字段非空；向量化时也只取该字段原值，不再混入额外摘要壳。
