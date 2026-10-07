@@ -41,6 +41,7 @@ class ChatEventTests(unittest.TestCase):
             "INDEX_PATH": self.data_dir / "memory.faiss",
             "META_PATH": self.data_dir / "meta.json",
             "REBUILD_STATE_PATH": self.data_dir / "rebuild_state.json",
+            "WRITE_LOCK_PATH": self.data_dir / ".memory-rag-write.lock",
         }
         self.patches = [patch.object(utils, name, value) for name, value in self.artifact_paths.items()]
         for active_patch in self.patches:

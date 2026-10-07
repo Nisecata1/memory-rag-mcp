@@ -57,6 +57,7 @@ from server_utils import (
     resolve_embed_device,
     resolve_embed_model_path,
     RETRIEVAL_FIELD_SIGNATURE,
+    serialized_write,
     update_store_and_rebuild,
     validate_update_changes,
     validate_update_changes_for_entry,
@@ -98,6 +99,7 @@ def get_detail_records_by_ids(record_ids: list[str]) -> dict[str, Any]:
 
 
 # 按多条记录 id 从主数据中硬删除条目，并在成功删除后更新主数据与向量库；保留在本文件是为了让“接口 -> 主数据变更 -> 触发重建”的链路可见。
+@serialized_write
 def delete_records_by_ids(
     record_ids: list[str],
     embedder: Any | None = None,
@@ -314,6 +316,7 @@ def search_records(
 
 # 保存一条结构化记忆；
 # 新增时增量编码新记录，并同步更新时间线与向量索引。
+@serialized_write
 def save_record(
     memory_kind: str,
     title: str,
@@ -400,6 +403,7 @@ def save_record(
 
 # 按 id 对一条已有记忆做补丁式更新；
 # 保留在主 server.py 文件是为了让“接口输入 -> 主数据补丁 -> 重建触发”的主流程保持可见。
+@serialized_write
 def update_record(
     record_id: str,
     changes: dict[str, Any],

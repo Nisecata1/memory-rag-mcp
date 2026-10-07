@@ -18,8 +18,8 @@ import time
 import threading
 import uuid
 from datetime import datetime
-from contextlib import closing
-from functools import lru_cache
+from contextlib import closing, contextmanager
+from functools import lru_cache, wraps
 from pathlib import Path
 from typing import Annotated, Any, Literal
 
@@ -203,6 +203,7 @@ EMBEDDINGS_PATH = PROJECT_CONFIG["embeddings_path"]  # 已计算向量的本地�
 INDEX_PATH = PROJECT_CONFIG["index_path"]  # FAISS 向量索引文件。
 META_PATH = PROJECT_CONFIG["meta_path"]  # 向量行号到记录 id 的映射文件。
 REBUILD_STATE_PATH = DATA_DIR / "rebuild_state.json"  # 后台全量重建状态文件。
+WRITE_LOCK_PATH = DATA_DIR / ".memory-rag-write.lock"  # 跨 stdio 进程串行化主数据和索引写入。
 EMBED_MODEL_PATH = PROJECT_CONFIG["embed_model_path"]  # YAML 配置中的本地嵌入模型目录。
 EMBED_DEVICE = PROJECT_CONFIG["embed_device"]  # YAML 配置中的嵌入设备。
 STORAGE_BACKEND = PROJECT_CONFIG["storage_backend"]  # 当前主数据存储后端；本轮固定为 sqlite。
@@ -285,6 +286,7 @@ PROJECT_REGISTRY_FIELD_RECORD_CANDIDATE_FIELDS = (
 )  # project_registry 只把这 3 个字段拆成 field_record，避免生成无意义的 short_summary 或路径子记录。
 MATCHED_FIELDS_LIMIT = 3  # search 返回的 matched_fields 最多保留 3 个，避免结果对象膨胀。
 BACKGROUND_REBUILD_MODE = "background_full_rebuild"  # 后台全量重建的固定模式名。
+REBUILD_STALE_GRACE_SECONDS = 30.0  # 跨 stdio 进程读取 running 状态时，给刚启动的 worker 留出同步窗口。
 _BACKGROUND_REBUILD_LOCK = threading.Lock()  # 同一进程内的后台重建串行锁。
 _BACKGROUND_REBUILD_THREAD: threading.Thread | None = None  # 当前进程里正在运行的后台重建线程引用。
 _SQLITE_INIT_LOCK = threading.Lock()  # 同一进程内串行初始化 SQLite，避免首次启动时重复建表或重复迁移。
@@ -450,6 +452,84 @@ def ensure_memory_dir() -> None:
     AI_MEMORY_DIR.mkdir(parents=True, exist_ok=True)
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     SQLITE_PATH.parent.mkdir(parents=True, exist_ok=True)
+
+
+@contextmanager
+def cross_process_write_lock(timeout_seconds: float = 30.0):
+    """Serialize one complete write/index refresh across independent MCP processes."""
+    ensure_memory_dir()
+    WRITE_LOCK_PATH.parent.mkdir(parents=True, exist_ok=True)
+    with WRITE_LOCK_PATH.open("a+b") as lock_handle:
+        lock_handle.seek(0)
+        if WRITE_LOCK_PATH.stat().st_size == 0:
+            lock_handle.write(b"0")
+            lock_handle.flush()
+        deadline = time.monotonic() + max(float(timeout_seconds), 0.0)
+        acquired = False
+        while not acquired:
+            try:
+                lock_handle.seek(0)
+                if os.name == "nt":
+                    import msvcrt
+
+                    msvcrt.locking(lock_handle.fileno(), msvcrt.LK_NBLCK, 1)
+                else:
+                    import fcntl
+
+                    fcntl.flock(lock_handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                acquired = True
+            except (BlockingIOError, OSError) as exc:
+                if time.monotonic() >= deadline:
+                    raise TimeoutError(
+                        "Timed out waiting for another memory-rag-mcp write operation."
+                    ) from exc
+                time.sleep(0.05)
+        try:
+            yield
+        finally:
+            lock_handle.seek(0)
+            if os.name == "nt":
+                import msvcrt
+
+                msvcrt.locking(lock_handle.fileno(), msvcrt.LK_UNLCK, 1)
+            else:
+                import fcntl
+
+                fcntl.flock(lock_handle.fileno(), fcntl.LOCK_UN)
+
+
+def is_write_lock_held() -> bool:
+    ensure_memory_dir()
+    WRITE_LOCK_PATH.parent.mkdir(parents=True, exist_ok=True)
+    with WRITE_LOCK_PATH.open("a+b") as lock_handle:
+        lock_handle.seek(0)
+        if WRITE_LOCK_PATH.stat().st_size == 0:
+            lock_handle.write(b"0")
+            lock_handle.flush()
+        try:
+            lock_handle.seek(0)
+            if os.name == "nt":
+                import msvcrt
+
+                msvcrt.locking(lock_handle.fileno(), msvcrt.LK_NBLCK, 1)
+                msvcrt.locking(lock_handle.fileno(), msvcrt.LK_UNLCK, 1)
+            else:
+                import fcntl
+
+                fcntl.flock(lock_handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                fcntl.flock(lock_handle.fileno(), fcntl.LOCK_UN)
+            return False
+        except (BlockingIOError, OSError):
+            return True
+
+
+def serialized_write(function):
+    @wraps(function)
+    def wrapped(*args, **kwargs):
+        with cross_process_write_lock():
+            return function(*args, **kwargs)
+
+    return wrapped
 
 
 # 打开一条 SQLite 连接，并统一设置本项目需要的基础 PRAGMA。
@@ -2617,8 +2697,52 @@ def write_rebuild_state(snapshot: dict[str, Any]) -> None:
     write_json_atomic(REBUILD_STATE_PATH, snapshot)
 
 
-# 读取 rebuild_state.json，并在检测到“旧进程残留的 running 状态”时自动纠正为 failed。
-# 这里直接用文件，而不是只靠进程内变量，是为了让后续请求能看到后台重建的最新状态。
+def is_process_alive(process_id: int) -> bool:
+    normalized_process_id = int(process_id or 0)
+    if normalized_process_id <= 0:
+        return False
+    if os.name == "nt":
+        import ctypes
+        from ctypes import wintypes
+
+        # Windows Python 3.10 treats os.kill(pid, 0) as TerminateProcess.
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel32.OpenProcess.argtypes = (wintypes.DWORD, wintypes.BOOL, wintypes.DWORD)
+        kernel32.OpenProcess.restype = wintypes.HANDLE
+        kernel32.WaitForSingleObject.argtypes = (wintypes.HANDLE, wintypes.DWORD)
+        kernel32.WaitForSingleObject.restype = wintypes.DWORD
+        kernel32.CloseHandle.argtypes = (wintypes.HANDLE,)
+        kernel32.CloseHandle.restype = wintypes.BOOL
+        handle = kernel32.OpenProcess(0x00100000, False, normalized_process_id)  # SYNCHRONIZE only
+        if not handle:
+            # ERROR_INVALID_PARAMETER means no such PID; other failures are inconclusive.
+            return ctypes.get_last_error() != 87
+        try:
+            return kernel32.WaitForSingleObject(handle, 0) != 0  # WAIT_OBJECT_0 means exited
+        finally:
+            kernel32.CloseHandle(handle)
+    try:
+        os.kill(normalized_process_id, 0)
+    except PermissionError:
+        return True
+    except (OSError, ProcessLookupError):
+        return False
+    return True
+
+
+def rebuild_snapshot_is_stale(snapshot: dict[str, Any]) -> bool:
+    started_at = str(snapshot.get("started_at") or "").strip()
+    if not started_at:
+        return True
+    try:
+        started_time = datetime.fromisoformat(started_at)
+    except ValueError:
+        return True
+    return (datetime.now() - started_time).total_seconds() >= REBUILD_STALE_GRACE_SECONDS
+
+
+# 读取 rebuild_state.json，并在确认 worker 进程已退出时自动纠正为 failed。
+# 跨 stdio 进程读取时，worker_pid 不等于当前请求进程是正常情况，不能仅凭 pid 不同判定陈旧。
 def load_rebuild_state() -> dict[str, Any]:
     if not REBUILD_STATE_PATH.exists():
         return build_rebuild_state_snapshot(state="idle", finished_at=now_iso())
@@ -2657,7 +2781,14 @@ def load_rebuild_state() -> dict[str, Any]:
         target_entry_count=int(raw_snapshot.get("target_entry_count") or 0),
         worker_pid=int(raw_snapshot.get("worker_pid") or 0),
     )
-    if snapshot["state"] == "running" and int(snapshot.get("worker_pid") or 0) != os.getpid():
+    worker_pid = int(snapshot.get("worker_pid") or 0)
+    if (
+        snapshot["state"] == "running"
+        and worker_pid != os.getpid()
+        and not is_process_alive(worker_pid)
+        and not is_write_lock_held()
+        and rebuild_snapshot_is_stale(snapshot)
+    ):
         failed_snapshot = build_rebuild_state_snapshot(
             state="failed",
             mode=str(snapshot.get("mode") or BACKGROUND_REBUILD_MODE),
