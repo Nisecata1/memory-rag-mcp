@@ -4,4 +4,5 @@ PyYAML==6.0.2
 pydantic==2.12.5
 mcp==1.26.0
 sentence-transformers==5.2.0
+transformers==4.52.4
 torch==2.7.0
