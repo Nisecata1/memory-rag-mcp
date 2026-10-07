@@ -58,14 +58,30 @@ project_registry 不再要求调用方传 short_summary；如果统一返回结�
   - `embedding`
   - `memory`
   - `summary`
-  - `search`
+- `search`
   - `retrieval`
   - `results`
 - 代码启动时会直接读取这份 YAML，并把它收口成当前运行常量。
+- `search.min_similarity`
+  - 可填 `null` 或 `0.0` 到 `1.0` 的数值；默认 `null`，表示关闭最低相似度过滤。
+  - 开启后，服务端先把多个向量命中折叠到主记忆并取最高分，再按 `score >= min_similarity` 过滤，最后执行 `top_k` 截取，因此返回数量可能少于 `top_k`。
+  - 修改后需要重启 MCP；该配置只影响结果裁剪，不改变向量文本、FAISS 或索引签名，也不需要重建索引。
+- `search.message_score_gap` 默认 `0.2`，必须为非负有限数，控制同一聊天记录内的消息命中分差。
+- `results.returnMessageNum` 默认 `10`，必须为非负整数，表示命中消息前后各扩展的消息条数。
+- `results.max_total_messages` 默认 `40`，必须为正整数，限制每条聊天详情返回的真实消息数和搜索返回的消息锚点数。
+- 缺少上述新增配置时使用默认值；修改后重启所有相关 MCP 进程生效，不改变切片、向量或索引签名，无需数据迁移或索引重建。
+- 消息按 `messages` 数组中的单条记录计数，不按一问一答计数；这些配置不限制单条消息长度或整批响应的字符/token 数。
 
 ## 项目 Requirements
 如果你准备 clone 这个仓库并在自己的机器上继续使用，最少需要先看清两类东西：
 1.代码仓库里会带什么 2.哪些私有资产需要你自己准备或接回本地。
+
+### 运行环境约束
+
+- 操作系统：`Windows x64`。其他系统当前没有完成现场验证。
+- Python：限定为 `3.10 x64`。当前完整验证环境是 Conda 提供的 `3.10.19`；Python.org 不提供该补丁版本的 Windows 安装器，新部署可使用最后一个带官方 Windows 安装器的 [`3.10.11`](https://www.python.org/downloads/release/python-31011/)。
+- 推理设备：当前按 `CPU` 建库和检索；本仓库不提供 CUDA 环境配置保证。
+- Python 包：以 `requirements.txt` 的精确版本为准，不提交或分发本机生成的 `.venv`。
 
 ### clone 仓库后即可获得的内容
 
@@ -77,7 +93,7 @@ project_registry 不再要求调用方传 short_summary；如果统一返回结�
 其中：
 
 - `config/settings.yaml` 的位置固定就是项目内的 `config/settings.yaml`
-- clone 完成后，直接在项目根目录执行 `pip install -r requirements.txt` 即可安装当前项目的 Python 直接依赖
+- clone 完成后，在项目根目录创建自己的 `.venv`，再按 `requirements.txt` 安装依赖；具体命令见下方“部署流程”
 
 ### 私有资产（不会随仓库自动带上）
 
@@ -145,7 +161,7 @@ project_registry 不再要求调用方传 short_summary；如果统一返回结�
 
 - 这些接口面向已经整理好的结构化输入，不负责替调用方阅读原始 Markdown、日志或网页。
 - 调用 `save` / `update` 前，应先把内容整理成结构化字段；如果用户指定了现成文档，应先阅读文档，再提取并补充结构化信息。
-- `project_record` 和 `fact` 使用 `detailed_summary` 作为正式正文；`chat_event` 改用只落 SQLite 的 `raw_dialogue` 保存完整对话。
+- `project_record` 和 `fact` 使用 `detailed_summary` 作为正式正文；`chat_event` 使用结构化 `raw_dialogue` 保存完整对话，并从其中派生消息级检索记录。
 - 当前不接受外部传业务时间字段；`created_at` 和 `updated_at` 都由服务端自动维护。
 - `memory.db` 是唯一事实源；向量索引、时间线和内部 `field_record` 都是基于主数据生成的衍生产物。
 - 当前 SQLite 主数据采用分表结构：轻总表负责路由，`project_record / chat_event / fact` 各自有详情表，`field_record` 独立成最小必要字段表。
@@ -165,7 +181,7 @@ project_registry 不再要求调用方传 short_summary；如果统一返回结�
   - 作用：按向量相似度检索最相关的历史记忆候选。
   - 返回方式：先查 `FAISS`，再按命中 id 回源 `SQLite` 主数据，只返回轻量候选字段和相似度分数；如果命中的是内部字段级子记忆，会先折叠回源到主记忆。
 - `get_details_by_ids`
-  - 作用：按一批记录 `ids` 读取完整详情。
+  - 作用：按一批记录 `ids` 读取详情；聊天默认返回只读上下文，全文需传 `full_dialogue=true`。
   - 返回方式：直接按 `id` 回源 `SQLite` 主数据，统一返回 `records` 列表和 `missing_ids`。
 - `delete_by_ids`
   - 作用：按一批记录 `ids` 从主数据中硬删除记忆。
@@ -229,8 +245,9 @@ project_registry 不再要求调用方传 short_summary；如果统一返回结�
   - 只允许写入已验证事实、用户明确实践过的操作，或能被文件、截图、日志、命令输出直接证明的结论，不得补写未经验证的推测、归因或建议。
 - `raw_dialogue`
   - 仅 `chat_event` 必填。
-  - 保存完整且去冗余的原始对话文本，包含角色、时间或会话来源等必要元信息。
-  - 只落 SQLite；不会进入 `retrieval_fields`、`field_record` 或向量检索文本。
+  - 新写入必须是 `{schema_version: 1, messages: [...], metadata?: {...}}` 对象；每条消息只允许 `user` 或 `assistant` 角色，并包含非空 `content`。
+  - 主字段只保存在 `chat_events`，不直接进入主记忆 `retrieval_fields`；每条消息会按 token 切片派生内部 `field_record`，其正文会进入向量检索。
+  - 历史字符串继续原样读取，暂不自动拆分或迁移。
 - `problem_background`
   - `project_record` 必填，其他类型可选。
   - 用于保存问题以及背景、故障现象，以及这条已解决问题为什么值得记录；不要写成流水账。
@@ -285,21 +302,17 @@ project_registry 不再要求调用方传 short_summary；如果统一返回结�
 - `index_refresh_mode`
   - 仅在后台重建时返回。
   - 当前固定值为 `background_full_rebuild`。
+- `index_refresh_reason`
+  - 仅在后台重建时返回。
+  - 说明触发全量重建的机器可读原因，例如 `cache_unavailable`、`signature_mismatch`、`missing_ids` 或 `payload_invalid`。
+- `missing_entry_count`
+  - 仅在存在未对齐索引 ID 时返回，表示检测到的缺失数量。
 - `search_available`
   - 仅在后台重建时返回。
   - `false` 表示主数据已写入，但 `search` 需要等后台重建完成后才能继续使用。
 - `message`
   - 仅在后台重建时返回。
   - 用于提示调用方：主数据已经写入，但索引仍在后台补齐。
-- `fact_extraction_reminder`
-  - 仅在本次真实写入的是非 `fact` 记忆时返回。
-  - 作用：提示调用方是否值得继续提取长期可复用 `fact`。
-  - 这里只返回结构化建议，不代表服务端已经自动完成 `fact` 提取。
-  - 当前固定包含：
-    - `decision_by_caller`：恒为 `true`，表示是否提取由调用方判断。
-    - `message`：简短提醒文案。
-    - `recommended_steps`：固定的后续推荐步骤。
-
 ### `save` 的核心字段
 
 - `memory_kind`
@@ -318,7 +331,7 @@ project_registry 不再要求调用方传 short_summary；如果统一返回结�
   - 默认不会进入 embedding 检索文本，主要保留给详情读取和长期归档。
 - `raw_dialogue`
   - 仅 `chat_event` 必填，用于完整对话回源。
-  - 不参与 embedding，也不会派生 `field_record`。
+  - 主字段本身不参与 embedding；其中的结构化消息会派生内部 `field_record` 并参与 embedding。
 - `problem_background`、`analysis`、`action_steps`、`validation_result`
   - `project_record` 必填。
   - `fact` 可为空；`chat_event` 不再包含这些字段。
@@ -381,9 +394,9 @@ meta_NpyRow-to-id.json <- sorted_entries 中真正有检索文本的 id 顺序
   - 内容只应来自已验证事实、用户明确实践过的操作，或有直接证据支撑的结论；如果与已有已验证内容相似，优先融合整理，不要重复新编近似说法。
 - `raw_dialogue`
   - 必填。
-  - 完整且去冗余的原始对话文本，应包含角色、时间或会话来源等必要元信息。
-  - 服务端只统一换行和清理首尾空白，不自动解析或语义去重。
-  - 只落 SQLite，不参与 embedding，也不会生成 `field_record`。
+  - 必须传结构化对象；`messages` 为非空数组，每项包含 `role` 和 `content`，可选 `message_id`、`timestamp`、`metadata`。
+  - `role` 只允许 `user`、`assistant`；服务端规范换行和边界空白，但不做语义去重。
+  - 主对象完整写入 SQLite；消息正文按 `retrieval.chat_event_chunk_max_tokens` 与当前模型 token 上限切片，分别生成 `field_record`。
 - `tags`
   - 可选传入，但最终存储必有。
   - 推荐由 AI 先生成标签数组。
@@ -436,7 +449,7 @@ meta_NpyRow-to-id.json <- sorted_entries 中真正有检索文本的 id 顺序
     - `tags`
     - `source_paths`
     - `reference_doc_path`
-  - `chat_event` 不允许修改 `detailed_summary`；`raw_dialogue` 不能传 `null` 或空字符串清除。
+  - `chat_event` 不允许修改 `detailed_summary`；更新 `raw_dialogue` 时必须提交完整结构化对象，服务端会整体替换该会话的消息级 `field_record`。
   - 如果需要切换记忆类型，不要把 `memory_kind` 塞进 `changes`；应改为调用 `save` 新建正确类型，再按需要删除旧记录。
   - 不允许直接修改：
     - `id`
@@ -474,21 +487,17 @@ meta_NpyRow-to-id.json <- sorted_entries 中真正有检索文本的 id 顺序
 - `index_refresh_mode`
   - 仅在后台重建时返回。
   - 当前固定值为 `background_full_rebuild`。
+- `index_refresh_reason`
+  - 仅在后台重建时返回。
+  - 说明触发全量重建的机器可读原因，例如 `cache_unavailable`、`signature_mismatch`、`missing_ids` 或 `payload_invalid`。
+- `missing_entry_count`
+  - 仅在存在未对齐索引 ID 时返回，表示检测到的缺失数量。
 - `search_available`
   - 仅在后台重建时返回。
   - `false` 表示主数据已更新，但 `search` 需要等后台重建完成后才能继续使用。
 - `message`
   - 仅在后台重建时返回。
   - 用于提示调用方：主数据已经更新，但索引仍在后台补齐。
-- `fact_extraction_reminder`
-  - 仅在本次真实更新后，且更新后的记忆类型不是 `fact` 时返回。
-  - 作用：提示调用方是否值得继续提取长期可复用 `fact`。
-  - 这里只返回结构化建议，不代表服务端已经自动完成 `fact` 提取。
-  - 当前固定包含：
-    - `decision_by_caller`：恒为 `true`，表示是否提取由调用方判断。
-    - `message`：简短提醒文案。
-    - `recommended_steps`：固定的后续推荐步骤。
-
 ## `search` 接口
 
 ### 功能说明
@@ -497,7 +506,7 @@ meta_NpyRow-to-id.json <- sorted_entries 中真正有检索文本的 id 顺序
 - `search` 不直接从时间线 Markdown 检索，而是先查 `FAISS`，再用 `meta` 中的 `row_to_id` 回源 `SQLite` 主数据。
 - `search` 只负责返回轻量候选结果，不承担完整详情读取。
 - 如果命中的是内部 `field_record`，服务端会先折叠回源到它的源头主记忆，再把主记忆返回给调用方。
-- 如果需要完整字段，应继续调用 `get_details_by_ids`。
+- 需要详情时，调用 `get_details_by_ids` 并按记录 id 分组透传 `matched_message_ids`；聊天全文须显式指定 `full_dialogue=true`。
 - 如果后台全量重建仍在运行，`search` 会直接拒绝并返回状态对象，不会继续返回旧索引结果。
 - 如果上一次后台重建失败，`search` 也会返回状态对象，并附带最近一次重建错误文本。
 
@@ -534,6 +543,9 @@ meta_NpyRow-to-id.json <- sorted_entries 中真正有检索文本的 id 顺序
       - 可选。
       - 只有在该主记忆是因为内部字段级子记忆命中而被召回时才返回。
       - 值是字段名数组，按贡献度排序，最多 3 个。
+- `results[].matched_message_ids` 仅对 `chat_event` 返回；没有消息级命中时为空数组。
+- 同一消息的多个切片取最高分；每条聊天记录独立计算最高消息分，保留分差不超过 `search.message_score_gap` 的消息，不与标题等字段分数比较。
+- 消息 ID 按分数降序、同分按原消息顺序排列，最多 `results.max_total_messages` 个；不改变原有主记录排序、`top_k` 或 `matched_fields`。
 - `search_available`
   - 仅在索引正在后台重建或上一次重建失败时返回。
   - `false` 表示当前不能安全使用 `search`。
@@ -542,6 +554,9 @@ meta_NpyRow-to-id.json <- sorted_entries 中真正有检索文本的 id 顺序
   - 当前可能值包括：
     - `running`
     - `failed`
+- `index_refresh_reason`
+  - 仅在 `search_available=false` 时返回。
+  - 与 `rebuild_state.json` 中的同名字段一致，说明本次后台重建的触发原因。
 - `message`
   - 仅在 `search_available=false` 时返回。
   - 用于说明当前为什么不能继续 `search`。
@@ -553,7 +568,7 @@ meta_NpyRow-to-id.json <- sorted_entries 中真正有检索文本的 id 顺序
 
 ### 功能说明
 
-- 用于按记录 `ids` 批量读取项目经验、会话事件或事实记忆的完整详情。
+- 用于按记录 `ids` 批量读取详情；`chat_event` 默认返回命中消息上下文，其他类型保持完整详情。
 - 这个接口不做向量搜索，只负责按主键回源主数据。
 - 服务端先根据 id 前缀判断记忆类型，再直接查询对应物理详情表；未知旧前缀会回查 `memory_registry`。
 - 详情读取不经过 `public_memory_view`，也不依赖全局详情字段白名单。
@@ -568,6 +583,8 @@ meta_NpyRow-to-id.json <- sorted_entries 中真正有检索文本的 id 顺序
   - 要读取的记录 id 数组。
   - 即使只查一条，也要传 `ids=["eventMemId-xxxx"]`。
   - 通常来自 `search` 结果中的 `id`。
+- `matched_message_ids` 可选，格式为 `{记录ID: [消息ID, ...]}`，键必须属于本次请求的 `ids`；按搜索返回的顺序透传，避免不同聊天记录的同名消息 ID 混用。
+- `full_dialogue` 可选，默认 `false`；为 `true` 时忽略消息锚点并返回原始完整 `raw_dialogue`，不添加省略项或只读标记，也不受消息数量上限限制。
 
 ### 返回字段
 
@@ -584,6 +601,33 @@ meta_NpyRow-to-id.json <- sorted_entries 中真正有检索文本的 id 顺序
   - `tags_json`、`source_paths_json` 会转换成 `tags`、`source_paths` 数组；`retrieval_fields_json` 不对外返回。
 - `missing_ids`
   - 本次请求中未找到的 id 列表。
+
+### 聊天上下文视图
+
+```json
+{
+  "ids": ["eventMemId-example"],
+  "matched_message_ids": {"eventMemId-example": ["msg-100", "msg-250"]},
+  "full_dialogue": false
+}
+```
+
+- 在当前 SQLite 正文中按消息 ID 定位，去重后保留输入优先级；不重跑向量检索，不依赖上次搜索的进程内状态。
+- 先保留有效锚点，超出总上限时只保留优先级最高的锚点；剩余名额按距离从近到远、同距离按锚点优先级、同锚点先前后后的顺序补充上下文。
+- 每个锚点最多向前和向后各扩展 `returnMessageNum` 条，重叠消息不重复占额度，最终按原对话顺序输出。
+- 无锚点时返回末尾 `min(2 * returnMessageNum + 1, max_total_messages)` 条，默认 21 条；部分锚点失效时使用有效项，全部失效时明确降级为末尾预览。
+- 原消息的角色、ID、正文和元数据保留；所有被跳过的连续区间，包括开头和结尾，都插入独立省略项。重叠或相邻窗口之间没有省略项。
+
+```json
+{"type": "omission", "omitted_count": 128, "content": "[... 省略 128 条消息 ...]"}
+```
+
+- 省略项不计入真实消息上限，也不带用户或助手角色。
+- `raw_dialogue.context.mode` 为 `matched_context` 或 `tail_preview`；`reason` 为 `matched_messages`、`no_anchors` 或 `anchors_not_found`，不会把预览冒充命中上下文。
+- `context` 还包含 `total_messages`、`returned_messages`、`truncated`、实际使用的 `anchor_message_ids`、失效的 `unresolved_message_ids` 和因上限丢弃的 `omitted_anchor_count`。
+- 默认视图始终是只读的，即使消息数较少没有裁剪，也不能直接传给 `save_chatEvent` 或 `update`；替换正文前必须先以 `full_dialogue=true` 读取全文。
+- 自动归档的查重、历史合并和更新恢复均显式读取全文，并校验没有上下文标记或省略项；无法确认完整格式时停止写入。
+- 旧的非结构化正文不能自动定位消息，需显式全文读取；默认视图不修改 SQLite 中的原始数据。
 
 ## `delete_by_ids` 接口
 
@@ -621,6 +665,11 @@ meta_NpyRow-to-id.json <- sorted_entries 中真正有检索文本的 id 顺序
 - `index_refresh_mode`
   - 仅在后台重建时返回。
   - 当前固定值为 `background_full_rebuild`。
+- `index_refresh_reason`
+  - 仅在后台重建时返回。
+  - 说明触发全量重建的机器可读原因，例如 `cache_unavailable`、`signature_mismatch`、`missing_ids` 或 `payload_invalid`。
+- `missing_entry_count`
+  - 仅在存在未对齐索引 ID 时返回，表示检测到的缺失数量。
 - `search_available`
   - 仅在后台重建时返回。
   - `false` 表示主数据已删除，但 `search` 需要等后台重建完成后才能继续使用。
@@ -636,30 +685,33 @@ meta_NpyRow-to-id.json <- sorted_entries 中真正有检索文本的 id 顺序
 - `retrieval_fields_json`
   - 这是 `SQLite` 里保存 `retrieval_fields` 的内部列。
   - 它继续参与检索文本拼接和索引刷新，但不会通过 `get_details_by_ids` 对外返回。
-- 当前默认 embedding 字段不包含 `detailed_summary` 或 `raw_dialogue`，而是优先使用 `title`、`short_summary`、`problem_background`、`analysis`、`action_steps`、`validation_result`、`tags`、`reference_doc_path`。
+- 当前主记忆默认 embedding 字段不包含 `detailed_summary` 或 `raw_dialogue`，而是优先使用 `title`、`short_summary`、`problem_background`、`analysis`、`action_steps`、`validation_result`、`tags`、`reference_doc_path`；结构化对话消息通过独立 `field_record` 进入索引。
 
 ## 当前实现特点
 
 - `search` 会先命中 `FAISS`，再回源到 `memory.db` 返回轻量候选字段。
 - 向量索引里同时包含主记忆和内部 `field_record`；`search` 命中 `field_record` 时会折叠回源到主记忆，并用 `matched_fields` 解释命中来源。
-- `get_details_by_ids` 是完整详情的唯一读取入口。
+- `get_details_by_ids` 是详情读取入口；聊天默认提供只读上下文，`full_dialogue=true` 才返回可用于完整正文回写的格式。
 - `get_details_by_ids` 按 id 类型直查 `project_records`、`chat_events`、`facts` 或 `project_registry`，不经过统一大宽表。
 - `delete_by_ids` 会在主数据删除成功后同步更新时间线，并基于本地 embedding 缓存重建向量索引，不会重复调用 embedding 模型。
 - `project_record` 和 `fact` 的 `detailed_summary` 会保留在主数据里，但默认不进入检索文本。
-- `chat_event.raw_dialogue` 只保存在 SQLite，并且只通过 `get_details_by_ids` 回源，不进入搜索结果或任何向量化链路。
+- `chat_event.raw_dialogue` 主对象只通过 `get_details_by_ids` 回源，不进入轻量搜索结果；但其 `user/assistant` 消息切片会同时保存为内部 `field_record` 并进入 FAISS。
 - 当前索引链路已经分成四层：`SQLite` 主数据、embedding 缓存矩阵、FAISS 索引、meta 映射；优化重点是减少重复 embedding，而不是完全不重建 FAISS。
+- Windows 的后台 worker 存活检测使用只读进程句柄，不使用 `os.kill(pid, 0)`，避免 Python 3.10 下检查状态时误终止重建进程。
 - `fact` 走同库新类型，不单独建第二套 store/index；当前版本不做自动提纯或自动分片。
-- `field_record` 现在按 one-hot 形态存储：`source_field_name` 是什么，就只让那个字段非空；向量化时也只取该字段原值，不再混入额外摘要壳。
+- 普通字段的 `field_record` 继续按 one-hot 形态存储；对话消息使用 `source_field_name=raw_dialogue`，并通过 `message_id + chunk_index` 生成多条稳定子记录。
+- 对话切片长度由 `settings.yaml` 配置和 embedding 模型元数据共同约束；修改切片策略会改变 `field_record_derivation_signature`，旧向量缓存必须重建。
 - 当前只有真正能拼出检索文本的记录才会进入 `memory_embeddings.npy`、`memory.faiss` 和 `meta_NpyRow-to-id.json`；空检索文本记录会被排除，避免把无意义空向量写进索引。
 - `field_record` 会跟随主记忆自动生成、同步和删除，但不会进入时间线，也不会计入对外展示的 `total_entries`。
 - 向量加载和归一化逻辑在当前目录下的 `embedding_utils.py` 中，不再依赖其他项目文件。
 
-# 一键部署流程
+# 部署流程
 
 ## 模型准备与配置
 
 部署前需要先准备本地 embedding 模型。仓库只包含代码，不附带本地模型文件。
 
+- 默认模型来源固定为 Hugging Face 上的 `BAAI/bge-m3`。
 - `embedding.model_path` 参数的意义是：**本地 embedding 模型目录**。
 - clone 仓库后，需要先自行下载模型，再把这个参数改成你自己机器上的实际模型目录。
 - 改完后重启 MCP 或重新加载 Codex 配置，并触发一次索引重建（比如调用一次 `save`），让新的模型生效。
@@ -696,21 +748,29 @@ meta_NpyRow-to-id.json <- sorted_entries 中真正有检索文本的 id 顺序
 默认使用方式：
 
 1. clone 仓库：把 `memory-rag-mcp/` 放到你的本地工作目录
-2. 安装依赖：在项目根目录执行（如果有虚拟环境先激活环境）：
+2. 确认当前命令指向 Python 3.10.x：
 
-   ```bash
-   pip install -r requirements.txt
+   ```powershell
+   python --version
    ```
 
-3. 确认配置文件仍位于项目内固定位置：
+3. 在项目根目录创建独立虚拟环境并安装依赖：
+
+   ```powershell
+   python -m venv .venv
+   .\.venv\Scripts\python.exe -m pip install --upgrade pip
+   .\.venv\Scripts\python.exe -m pip install -r requirements.txt
+   ```
+
+4. 确认配置文件仍位于项目内固定位置：
    - `config/settings.yaml`
-4. 如果你本地的项目目录、数据目录或时间线路径与默认布局不同，修改 `settings.yaml` 里的 `paths.*`
-5. 准备本地 embedding 模型，并按上面的“模型准备与配置”完成下载和参数修改
-6. 如果只是想把项目跑起来，不接旧数据也可以，后续直接开始 `save` 即可
-7. 如果想继续使用旧 AI 记忆，再把私有数据目录 `memory-rag-mcp-data/` 整体接回本地；时间线文件现在也包含在这个目录里
-8. 按下方“`MCP 注册（推荐 direct python）`”完成 `~/.codex/config.toml` 注册（可以让 AI 协助生成）
-9. 做一次最小校验：
-   - `python -m py_compile server.py`
+5. 如果你本地的项目目录、数据目录或时间线路径与默认布局不同，修改 `settings.yaml` 里的 `paths.*`
+6. 从 `BAAI/bge-m3` 下载模型，并按上面的“模型准备与配置”完成路径修改
+7. 如果只是想把项目跑起来，不接旧数据也可以，后续直接开始 `save` 即可
+8. 如果想继续使用旧 AI 记忆，再把私有数据目录 `memory-rag-mcp-data/` 整体接回本地；时间线文件现在也包含在这个目录里
+9. 按下方“`MCP 注册（推荐 direct python）`”完成 `~/.codex/config.toml` 注册（可以让 AI 协助生成）
+10. 做一次最小校验：
+   - `.\.venv\Scripts\python.exe -m py_compile server.py`
    - 再执行一次 `search` 冒烟测试，确认服务可用
 
 ## MCP 注册（推荐 direct python）
@@ -720,7 +780,7 @@ meta_NpyRow-to-id.json <- sorted_entries 中真正有检索文本的 id 顺序
 ```toml
 [mcp_servers.memory-rag-mcp]
 type = "stdio"
-command = "C:\\path\\to\\your-env\\python.exe"
+command = "C:\\path\\to\\memory-rag-mcp\\.venv\\Scripts\\python.exe"
 args = ["-u", "C:\\path\\to\\memory-rag-mcp\\server.py"]
 enabled = true
 ```
