@@ -11,11 +11,11 @@ from __future__ import annotations
 import json
 import sys
 from pathlib import Path
-from typing import Annotated, Any
+from typing import Annotated, Any, Literal
 
 import faiss
 from mcp.server.fastmcp import FastMCP
-from pydantic import Field
+from pydantic import BaseModel, ConfigDict, Field
 
 CURRENT_DIR = Path(__file__).resolve().parent
 if str(CURRENT_DIR) not in sys.path:
@@ -24,6 +24,7 @@ if str(CURRENT_DIR) not in sys.path:
 # 导入 server_utils 中的底层函数
 from server_utils import (
     INDEX_PATH,
+    FIELD_RECORD_DERIVATION_SIGNATURE,
     MATCHED_FIELDS_LIMIT,
     MAX_TOP_K,
     META_PATH,
@@ -32,8 +33,8 @@ from server_utils import (
     MemoryKind,
     SourcePathListInput,
     TagListInput,
-    build_fact_extraction_reminder,
     build_embedding_model_fingerprint,
+    build_dialogue_context,
     build_payload,
     build_project_id,
     build_update_candidate_record,
@@ -56,7 +57,10 @@ from server_utils import (
     generate_memory_id,
     resolve_embed_device,
     resolve_embed_model_path,
+    resolve_field_record_value,
+    select_matched_message_ids,
     RETRIEVAL_FIELD_SIGNATURE,
+    SEARCH_MIN_SIMILARITY,
     serialized_write,
     update_store_and_rebuild,
     validate_update_changes,
@@ -74,8 +78,21 @@ server = FastMCP(
 )
 
 # 按多条记录 id 回源主数据并返回类型化详情；这里直接调用物理表读取链路，不碰 meta 或统一公共视图。
-def get_detail_records_by_ids(record_ids: list[str]) -> dict[str, Any]:
+def get_detail_records_by_ids(
+    record_ids: list[str],
+    matched_message_ids: dict[str, list[str]] | None = None,
+    full_dialogue: bool = False,
+) -> dict[str, Any]:
     normalized_ids = normalize_record_ids(record_ids)
+    anchors_by_id = matched_message_ids if matched_message_ids is not None else {}
+    if not full_dialogue:
+        if not isinstance(anchors_by_id, dict) or any(
+            record_id not in normalized_ids
+            or not isinstance(message_ids, list)
+            or any(not isinstance(message_id, str) or not message_id.strip() for message_id in message_ids)
+            for record_id, message_ids in anchors_by_id.items()
+        ):
+            raise ValueError("matched_message_ids must map requested record IDs to non-empty message ID strings.")
     fetched_entries = fetch_detail_records_by_ids(normalized_ids)
     store_entry_map = {
         str(entry.get("id") or "").strip(): entry
@@ -89,6 +106,13 @@ def get_detail_records_by_ids(record_ids: list[str]) -> dict[str, Any]:
         if source_entry is None:
             missing_ids.append(normalized_record_id)
             continue
+        if source_entry.get("memory_kind") == "chat_event" and not full_dialogue:
+            source_entry = {
+                **source_entry,
+                "raw_dialogue": build_dialogue_context(
+                    source_entry.get("raw_dialogue"), anchors_by_id.get(normalized_record_id)
+                ),
+            }
         records.append(source_entry)
 
     return {
@@ -152,8 +176,11 @@ def delete_records_by_ids(
     if "index_refresh_state" in rebuild_result:
         result["index_refresh_state"] = rebuild_result["index_refresh_state"]
         result["index_refresh_mode"] = rebuild_result["index_refresh_mode"]
+        result["index_refresh_reason"] = rebuild_result["index_refresh_reason"]
         result["search_available"] = rebuild_result["search_available"]
         result["message"] = rebuild_result["message"]
+        if "missing_entry_count" in rebuild_result:
+            result["missing_entry_count"] = rebuild_result["missing_entry_count"]
     return result
 
 
@@ -197,6 +224,10 @@ def search_records(
     if str(meta.get("retrieval_field_signature") or "") != RETRIEVAL_FIELD_SIGNATURE:
         raise RuntimeError(
             "Vector index retrieval field signature does not match current code. Rebuild the index before searching."
+        )
+    if str(meta.get("field_record_derivation_signature") or "") != FIELD_RECORD_DERIVATION_SIGNATURE:
+        raise RuntimeError(
+            "Vector index field-record derivation signature does not match current code. Rebuild the index before searching."
         )
     resolved_embedder = embedder or get_embedder(resolved_model_path, resolve_embed_device())
     query_vector = encode_texts([normalized_query], resolved_embedder)
@@ -253,6 +284,7 @@ def search_records(
 
     aggregated_results: dict[str, dict[str, Any]] = {}
     matched_field_scores: dict[str, dict[str, float]] = {}
+    matched_message_scores: dict[str, dict[str, tuple[float, int]]] = {}
     for row_index, score in zip(indices[0].tolist(), scores[0].tolist()):
         if row_index < 0 or row_index >= len(row_ids):
             continue
@@ -290,15 +322,33 @@ def search_records(
                 float(score),
                 matched_field_scores[result_id].get(matched_field_name, float("-inf")),
             )
+        if matched_field_name == "raw_dialogue" and source_entry.get("memory_kind") == "chat_event":
+            segment = resolve_field_record_value(matched_entry, "raw_dialogue")
+            if isinstance(segment, dict):
+                message_id = segment.get("message_id")
+                message_index = segment.get("message_index")
+                if isinstance(message_id, str) and message_id and type(message_index) is int and message_index >= 0:
+                    message_scores = matched_message_scores.setdefault(result_id, {})
+                    previous = message_scores.get(message_id)
+                    if previous is None or float(score) > previous[0]:
+                        message_scores[message_id] = (float(score), message_index)
 
+    eligible_results = [
+        result
+        for result in aggregated_results.values()
+        if SEARCH_MIN_SIMILARITY is None
+        or float(result.get("score") or 0.0) >= SEARCH_MIN_SIMILARITY
+    ]
     sorted_results = sorted(
-        aggregated_results.values(),
+        eligible_results,
         key=lambda item: float(item.get("score") or 0.0),
         reverse=True,
     )
     final_results: list[dict[str, Any]] = []
     for result in sorted_results[:resolved_top_k]:
         result_id = str(result.get("id") or "").strip()
+        if public_entry_map[result_id].get("memory_kind") == "chat_event":
+            result["matched_message_ids"] = select_matched_message_ids(matched_message_scores.get(result_id, {}))
         field_score_map = matched_field_scores.get(result_id) or {}
         if field_score_map:
             result["matched_fields"] = [
@@ -322,7 +372,7 @@ def save_record(
     title: str,
     short_summary: str,
     detailed_summary: str | None = None,
-    raw_dialogue: str | None = None,
+    raw_dialogue: Any = None,
     overview_summary: str | None = None,
     problem_background: str | None = None,
     analysis: str | None = None,
@@ -392,12 +442,11 @@ def save_record(
     if "index_refresh_state" in rebuild_result:
         result["index_refresh_state"] = rebuild_result["index_refresh_state"]
         result["index_refresh_mode"] = rebuild_result["index_refresh_mode"]
+        result["index_refresh_reason"] = rebuild_result["index_refresh_reason"]
         result["search_available"] = rebuild_result["search_available"]
         result["message"] = rebuild_result["message"]
-    # 第九块：非 fact 记忆真实写入成功后，附带一个结构化的 fact 提取提醒。
-    # 这里不代表服务端已自动提取 fact，而是把后续推荐流程显式返回给调用方。
-    if str(normalized_saved_entry.get("memory_kind") or "").strip() != "fact":
-        result["fact_extraction_reminder"] = build_fact_extraction_reminder()
+        if "missing_entry_count" in rebuild_result:
+            result["missing_entry_count"] = rebuild_result["missing_entry_count"]
     return result
 
 
@@ -470,12 +519,11 @@ def update_record(
     if "index_refresh_state" in rebuild_result:
         result["index_refresh_state"] = rebuild_result["index_refresh_state"]
         result["index_refresh_mode"] = rebuild_result["index_refresh_mode"]
+        result["index_refresh_reason"] = rebuild_result["index_refresh_reason"]
         result["search_available"] = rebuild_result["search_available"]
         result["message"] = rebuild_result["message"]
-    # 第九块：非 fact 记忆真实更新成功后，附带一个结构化的 fact 提取提醒。
-    # 需不需要继续提取 fact 由调用方判断，服务端本轮只返回建议，不做自动语义提取。
-    if str(normalized_updated_entry.get("memory_kind") or "").strip() != "fact":
-        result["fact_extraction_reminder"] = build_fact_extraction_reminder()
+        if "missing_entry_count" in rebuild_result:
+            result["missing_entry_count"] = rebuild_result["missing_entry_count"]
     return result
 
 
@@ -668,13 +716,31 @@ def save_fact(
     )
 
 
+class ChatDialogueMessageInput(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    message_id: str | None = Field(default=None, description="可选。消息稳定标识；缺失时由服务端生成。")
+    role: Literal["user", "assistant"] = Field(description="必填。消息角色，只允许 user 或 assistant。")
+    content: str = Field(min_length=1, description="必填。该轮用户问题或 AI 回答的原始正文。")
+    timestamp: str | None = Field(default=None, description="可选。消息时间字符串。")
+    metadata: dict[str, Any] | None = Field(default=None, description="可选。只保存、不参与向量化的消息元信息。")
+
+
+class ChatRawDialogueInput(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    schema_version: Literal[1] = Field(default=1, description="结构化对话协议版本，当前固定为 1。")
+    messages: list[ChatDialogueMessageInput] = Field(min_length=1, description="按原始顺序排列的 user/assistant 消息。")
+    metadata: dict[str, Any] | None = Field(default=None, description="可选。只保存、不参与向量化的会话级元信息。")
+
+
 # 对外暴露 save_chatEvent 工具，固定把当前写入保存成新的 chat_event 事件记忆。
 @server.tool(
     name="save_chatEvent",
     description=(
         "专门用于保存一条会话事件记忆。"
         "这个接口固定把 memory_kind 设为 chat_event。"
-        "raw_dialogue 保存调用方已经去冗余并补齐必要元信息的完整对话，只落 SQLite，不参与向量化。"
+        "raw_dialogue 保存结构化 user/assistant 原始消息；主字段不直接参与向量化，但每条消息会派生内部 field_record 用于检索。"
         "chat_event 默认按新事件存储，不因为主题相近、人物相近或问题相近，就默认更新旧 chat_event。"
         "只有在补充刚写入不久的同一事件，或纠正原记录事实错误时，才应优先考虑 update 旧 chat_event。"
         "正式入库内容只应包含已验证的事实、用户明确实践过的操作，或能被文件、截图、日志、命令输出直接证明的结论；不要把未验证的推测、归因或建议写成正式记忆。"
@@ -696,13 +762,25 @@ def save_chatEvent(
         ),
     ],
     raw_dialogue: Annotated[
-        str,
+        ChatRawDialogueInput,
         Field(
             description=(
-                "必填。完整且去冗余的原始对话文本，应包含角色、时间或会话来源等必要元信息。"
-                "服务端只统一换行和清理首尾空白，不自动解析或去重。"
-                "该字段只落 SQLite，并且不会进入 retrieval_fields、field_record 或向量检索文本。"
-            )
+                "必填。结构为 {schema_version: 1, messages: [...], metadata?: {...}}。"
+                "messages 每项必须包含 role（仅 user 或 assistant）和非空 content；"
+                "message_id 可省略并由服务端稳定生成，timestamp、metadata 可选。"
+                "主 raw_dialogue 不进入主记忆 retrieval_fields，但每条消息会按模型 token 上限切片并派生内部 field_record。"
+            ),
+            json_schema_extra={
+                "examples": [
+                    {
+                        "schema_version": 1,
+                        "messages": [
+                            {"message_id": "msg-001", "role": "user", "content": "用户原始问题"},
+                            {"message_id": "msg-002", "role": "assistant", "content": "AI 原始回答"},
+                        ],
+                    }
+                ]
+            },
         ),
     ],
     tags: Annotated[
@@ -738,7 +816,7 @@ def save_chatEvent(
         memory_kind="chat_event",
         title=title,
         short_summary=short_summary,
-        raw_dialogue=raw_dialogue,
+        raw_dialogue=raw_dialogue.model_dump(exclude_none=True),
         tags=tags,
         source_paths=source_paths,
         reference_doc_path=reference_doc_path,
@@ -921,7 +999,9 @@ def update(
                 "允许字段包括 title、short_summary、overview_summary、detailed_summary、raw_dialogue、"
                 "problem_background、analysis、action_steps、validation_result、"
                 "tags、source_paths、reference_doc_path。"
-                "raw_dialogue 只适用于 chat_event，且不能清空；detailed_summary 不再适用于 chat_event。"
+                "raw_dialogue 只适用于 chat_event；修改时必须传完整结构化对象，不能传字符串、null 或空对象。"
+                "应先通过 get_details_by_ids(full_dialogue=true) 读取全文；带 context 的只读上下文视图会被拒绝。"
+                "服务端会整体替换并重建这条会话的消息级 field_record；detailed_summary 不再适用于 chat_event。"
                 "传入的业务字段值只应包含已验证事实、用户明确实践过的操作，或能被文件、截图、日志、命令输出直接证明的结论；"
                 "不要把未验证的推测、归因或建议写成更新内容。"
                 "project_id 不允许通过 update 修改。"
@@ -940,7 +1020,7 @@ def update(
     name="search",
     description=(
         "按向量相似度检索已保存的项目经验、项目摘要、会话事件和事实记忆，返回最相关的 top-k 条轻量候选记录。"
-        "如果需要完整详情，请使用 get_details_by_ids。"
+        "需要详情时调用 get_details_by_ids，并将各结果的 matched_message_ids 按记录 id 分组透传，读取命中消息上下文。"
     ),
 )
 def search(
@@ -960,14 +1040,18 @@ def search(
     resolved_top_k = 5 if top_k is None else max(1, min(int(top_k), MAX_TOP_K))
     rebuild_state_name = str(rebuild_state.get("state") or "").strip()
     if rebuild_state_name == "running":
-        return {
+        response = {
             "query": query,
             "top_k": resolved_top_k,
             "results": [],
             "search_available": False,
             "rebuild_state": "running",
+            "index_refresh_reason": str(rebuild_state.get("index_refresh_reason") or ""),
             "message": "索引正在后台重建，请稍后重试 search。",
         }
+        if int(rebuild_state.get("missing_entry_count") or 0):
+            response["missing_entry_count"] = int(rebuild_state["missing_entry_count"])
+        return response
     if rebuild_state_name == "failed":
         return {
             "query": query,
@@ -975,6 +1059,7 @@ def search(
             "results": [],
             "search_available": False,
             "rebuild_state": "failed",
+            "index_refresh_reason": str(rebuild_state.get("index_refresh_reason") or ""),
             "message": "索引重建上一次失败了；先触发一次新的写入，让系统重新重建索引，再继续 search。",
             "last_error": str(rebuild_state.get("last_error") or ""),
         }
@@ -986,13 +1071,16 @@ def search(
     }
 
 
-# 对外暴露 get_details_by_ids 工具，用于按多条记录 id 读取完整详情。
+# 对外暴露详情读取工具；chat_event 默认返回只读上下文视图，显式请求才返回全文。
 @server.tool(
     name="get_details_by_ids",
     description=(
-        "按记录 ids 读取一批项目经验、会话事件或事实记忆的完整详情。"
+        "按记录 ids 读取一批项目经验、会话事件或事实记忆的详情。"
         "服务端根据 id 前缀直查对应的 SQLite 物理详情表；未知旧前缀会回查 memory_registry。"
-        "chat_event 会返回 raw_dialogue，但不再返回 detailed_summary。"
+        "chat_event 默认返回 raw_dialogue 只读上下文视图；透传 search 的 matched_message_ids 可定位命中消息。"
+        "默认前后各扩展10条、每条记录最多40条真实消息，具体以配置为准；未提供定位时返回末尾预览。"
+        "context 说明裁剪状态，messages 中 type=omission 表示省略区间，不是实际对话消息。"
+        "归档查重、合并写入或需要全文时必须传 full_dialogue=true；禁止将上下文视图直接回写 update。"
         "如果部分 id 不存在，会在 missing_ids 中显式返回。"
     ),
 )
@@ -1004,8 +1092,18 @@ def get_details_by_ids(
             json_schema_extra={"examples": [["eventMemId-123456789abc", "factMemId-abcdef123456"]]},
         ),
     ],
+    matched_message_ids: Annotated[
+        dict[str, list[str]] | None,
+        Field(description="可选。按记录 id 分组的 search 命中消息 ID，保留其相关性顺序，例如 {\"eventMemId-xxx\": [\"msg-1\", \"msg-2\"]}。"),
+    ] = None,
+    full_dialogue: Annotated[
+        bool,
+        Field(description="默认 false。true 返回完整原始对话，忽略消息锚点和返回条数限制；合并写入前必须使用。"),
+    ] = False,
 ) -> dict[str, Any]:
-    return get_detail_records_by_ids(record_ids=ids)
+    return get_detail_records_by_ids(
+        record_ids=ids, matched_message_ids=matched_message_ids, full_dialogue=full_dialogue
+    )
 
 
 # 对外暴露 delete_by_ids 工具，用于从主数据中硬删除多条记录并重建库。

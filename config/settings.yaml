@@ -44,9 +44,13 @@ summary:
 # 搜索接口的基础限制。
 search:
   max_top_k: 20 # 搜索接口允许返回的最大条数。
+  min_similarity: null # 实体级最低相似度阈值；null 表示关闭过滤。
+  message_score_gap: 0.2 # 同一聊天记录内，相对最高分消息的最大分差，包含边界。
 
 # 检索文本拼接规则。
 retrieval:
+  chat_event_chunk_max_tokens: 1024 # 对话消息切片的配置上限；实际生效值为 min{当前 embedding 模型上限，该配置项}。最好不要太高，会稀释
+  chat_event_chunk_overlap_tokens: 128 # 相邻消息切片的重叠 token 数；必须小于最终有效切片长度。
   field_candidates: # 默认参与检索文本拼接的字段顺序。
     - title
     - short_summary
@@ -70,6 +74,8 @@ retrieval:
 
 # 对外结果字段裁剪规则。
 results:
+  returnMessageNum: 10 # 命中消息前后各扩展的消息条数，不是一问一答的轮数。
+  max_total_messages: 40 # 默认详情每条聊天记录的真实消息上限；省略项不占额度。
   search_fields: # search 默认返回的轻量字段。
     - id
     - memory_kind

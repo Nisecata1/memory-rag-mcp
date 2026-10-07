@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import os
 import re
 import sqlite3
@@ -33,7 +34,7 @@ CURRENT_DIR = Path(__file__).resolve().parent
 if str(CURRENT_DIR) not in sys.path:
     sys.path.insert(0, str(CURRENT_DIR))
 
-from embedding_utils import l2_normalize, load_sentence_embedder
+from embedding_utils import l2_normalize, load_embedding_tokenizer, load_sentence_embedder
 
 
 CONFIG_DIR = CURRENT_DIR / "config"  # 项目配置目录。
@@ -138,8 +139,23 @@ def load_project_config() -> dict[str, Any]:
     max_top_k = int(search_config.get("max_top_k") or 0)
     if max_top_k <= 0:
         raise RuntimeError(f"search.max_top_k in {CONFIG_PATH.name} must be a positive integer.")
+    min_similarity = parse_min_similarity(search_config.get("min_similarity"))
+    message_score_gap, return_message_num, max_total_messages = parse_dialogue_return_config(
+        search_config, results_config
+    )
 
     # 第六阶段：解析检索文本拼接规则和 search 结果裁剪规则，保证字段列表和标签映射彼此一致。
+    chat_event_chunk_max_tokens = int(retrieval_config.get("chat_event_chunk_max_tokens") or 0)
+    chat_event_chunk_overlap_tokens = int(retrieval_config.get("chat_event_chunk_overlap_tokens") or 0)
+    if chat_event_chunk_max_tokens <= 0:
+        raise RuntimeError(
+            f"retrieval.chat_event_chunk_max_tokens in {CONFIG_PATH.name} must be a positive integer."
+        )
+    if chat_event_chunk_overlap_tokens < 0 or chat_event_chunk_overlap_tokens >= chat_event_chunk_max_tokens:
+        raise RuntimeError(
+            f"retrieval.chat_event_chunk_overlap_tokens in {CONFIG_PATH.name} must be non-negative and smaller than chat_event_chunk_max_tokens."
+        )
+
     field_candidates = retrieval_config.get("field_candidates")
     field_labels = retrieval_config.get("field_labels")
     if not isinstance(field_candidates, list) or not field_candidates:
@@ -184,10 +200,46 @@ def load_project_config() -> dict[str, Any]:
         "tag_fallback_limit": tag_fallback_limit,
         "short_summary_max_length": short_summary_max_length,
         "max_top_k": max_top_k,
+        "min_similarity": min_similarity,
+        "message_score_gap": message_score_gap,
+        "return_message_num": return_message_num,
+        "max_total_messages": max_total_messages,
+        "chat_event_chunk_max_tokens": chat_event_chunk_max_tokens,
+        "chat_event_chunk_overlap_tokens": chat_event_chunk_overlap_tokens,
         "retrieval_field_candidates": normalized_field_candidates,
         "field_labels": normalized_field_labels,
         "search_result_fields": normalized_search_fields,
     }
+
+
+def parse_dialogue_return_config(
+    search_config: dict[str, Any], results_config: dict[str, Any]
+) -> tuple[float, int, int]:
+    gap = search_config.get("message_score_gap", 0.2)
+    if isinstance(gap, bool) or not isinstance(gap, (int, float)) or not math.isfinite(gap) or gap < 0:
+        raise RuntimeError("search.message_score_gap must be a non-negative finite number.")
+    radius = results_config.get("returnMessageNum", 10)
+    limit = results_config.get("max_total_messages", 40)
+    for name, value, minimum in (("returnMessageNum", radius, 0), ("max_total_messages", limit, 1)):
+        if isinstance(value, bool) or not isinstance(value, int) or value < minimum:
+            raise RuntimeError(f"results.{name} must be an integer >= {minimum}.")
+    return float(gap), radius, limit
+
+
+def parse_min_similarity(value: Any) -> float | None:
+    """Validate the optional entity-level search score floor from settings.yaml."""
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise RuntimeError(
+            f"search.min_similarity in {CONFIG_PATH.name} must be null or a number between 0 and 1."
+        )
+    parsed_value = float(value)
+    if not math.isfinite(parsed_value) or not 0.0 <= parsed_value <= 1.0:
+        raise RuntimeError(
+            f"search.min_similarity in {CONFIG_PATH.name} must be null or a number between 0 and 1."
+        )
+    return parsed_value
 
 
 # 模块导入时先生成一次项目级配置快照。
@@ -211,10 +263,22 @@ SQLITE_PATH = PROJECT_CONFIG["sqlite_path"]  # SQLite 主数据文件。
 
 # 这一组是业务规则与返回裁剪常量，负责约束搜索上限、检索字段以及接口默认返回字段。
 MAX_TOP_K = PROJECT_CONFIG["max_top_k"]  # 搜索结果最大返回条数。
+SEARCH_MIN_SIMILARITY = PROJECT_CONFIG["min_similarity"]  # 实体级最低相似度阈值；None 表示关闭。
+MESSAGE_SCORE_GAP = PROJECT_CONFIG["message_score_gap"]
+RETURN_MESSAGE_NUM = PROJECT_CONFIG["return_message_num"]
+MAX_TOTAL_MESSAGES = PROJECT_CONFIG["max_total_messages"]
+CHAT_EVENT_CHUNK_MAX_TOKENS = PROJECT_CONFIG["chat_event_chunk_max_tokens"]
+CHAT_EVENT_CHUNK_OVERLAP_TOKENS = PROJECT_CONFIG["chat_event_chunk_overlap_tokens"]
 TAG_FALLBACK_LIMIT = PROJECT_CONFIG["tag_fallback_limit"]  # 服务端兜底标签的最大数量。
 SHORT_SUMMARY_MAX_LENGTH = PROJECT_CONFIG["short_summary_max_length"]  # 自动生成简短摘要时的最大字符数。
 RETRIEVAL_FIELD_CANDIDATES = PROJECT_CONFIG["retrieval_field_candidates"]  # 统一的检索文本候选字段顺序。
 RETRIEVAL_FIELD_SIGNATURE = "|".join(RETRIEVAL_FIELD_CANDIDATES)  # 当前检索字段规则签名，用来判断旧 embedding 是否失效。
+FIELD_RECORD_DERIVATION_SIGNATURE = (
+    "chat_dialogue_v1"
+    f"|roles=user,assistant"
+    f"|chunk_max={CHAT_EVENT_CHUNK_MAX_TOKENS}"
+    f"|chunk_overlap={CHAT_EVENT_CHUNK_OVERLAP_TOKENS}"
+)
 FIELD_LABELS = PROJECT_CONFIG["field_labels"]  # 检索文本拼接时使用的人类可读字段标签。
 MEMORY_KIND_VALUES = PROJECT_CONFIG["memory_kind_values"]  # 允许的记忆类型枚举值。
 SEARCH_RESULT_FIELDS = PROJECT_CONFIG["search_result_fields"]  # search 默认返回的轻量字段。
@@ -267,6 +331,10 @@ FIELD_RECORD_CANDIDATE_FIELDS = (
     "tags",
     "reference_doc_path",
 )  # 自动拆成 field_record 的字段范围；不含 source_paths，避免把来源证明字段变成主要语义噪音。
+CHAT_EVENT_DIALOGUE_FIELD_NAME = "raw_dialogue"
+SUPPORTED_FIELD_RECORD_SOURCE_FIELDS = (*FIELD_RECORD_CANDIDATE_FIELDS, CHAT_EVENT_DIALOGUE_FIELD_NAME)
+CHAT_DIALOGUE_SCHEMA_VERSION = 1
+CHAT_DIALOGUE_ROLES = ("user", "assistant")
 FACT_RETRIEVAL_FIELD_CANDIDATES = (
     "title",
     "short_summary",
@@ -567,34 +635,76 @@ def load_json_string_list(value: Any) -> list[str]:
     return normalize_list([str(item or "").strip() for item in parsed])
 
 
+# 把结构化新对话编码成 JSON；legacy 字符串保持原样，避免隐式迁移历史正文。
+def dump_raw_dialogue(value: str | dict[str, Any] | None) -> str:
+    if isinstance(value, dict):
+        return json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+    return str(value or "")
+
+
+def load_raw_dialogue(value: Any) -> str | dict[str, Any]:
+    raw_text = str(value or "")
+    if not raw_text.strip():
+        return ""
+    try:
+        parsed = json.loads(raw_text)
+    except json.JSONDecodeError:
+        return raw_text
+    if not isinstance(parsed, dict):
+        return raw_text
+    try:
+        normalized = normalize_raw_dialogue(parsed, allow_legacy=False)
+    except ValueError:
+        return raw_text
+    return normalized if isinstance(normalized, dict) else raw_text
+
+
 # 把 field_record 的单字段值编码成 SQLite 可直接保存的 JSON 文本。
-def dump_field_record_value_json(field_value: str | list[str]) -> str:
+def dump_field_record_value_json(field_value: str | list[str] | dict[str, Any]) -> str:
+    if isinstance(field_value, dict):
+        return json.dumps(field_value, ensure_ascii=False, separators=(",", ":"))
     if isinstance(field_value, list):
         return json.dumps(normalize_list(field_value), ensure_ascii=False)
     return json.dumps(str(field_value or ""), ensure_ascii=False)
 
 
 # 把 field_record 的单字段值渲染成检索文本，供 source_field_value_text 落盘。
-def render_field_record_value_text(field_value: str | list[str]) -> str:
+def render_field_record_value_text(field_value: str | list[str] | dict[str, Any]) -> str:
+    if isinstance(field_value, dict):
+        role = str(field_value.get("role") or "").strip()
+        content = str(field_value.get("content") or "")
+        return f"{role}: {content}" if role else content
     if isinstance(field_value, list):
         return "，".join(normalize_list(field_value))
     return str(field_value or "")
 
 
 # 从 SQLite 里的 JSON 文本恢复 field_record 的真实字段值。
-def load_field_record_value_json(source_field_name: str, json_text: Any, fallback_text: Any) -> str | list[str]:
+def load_field_record_value_json(
+    source_field_name: str,
+    json_text: Any,
+    fallback_text: Any,
+) -> str | list[str] | dict[str, Any]:
     raw_json_text = str(json_text or "").strip()
     if raw_json_text:
         try:
             parsed = json.loads(raw_json_text)
         except json.JSONDecodeError:
             parsed = None
-        if source_field_name == "tags":
+        if source_field_name == CHAT_EVENT_DIALOGUE_FIELD_NAME:
+            if isinstance(parsed, dict):
+                return parsed
+        elif source_field_name == "tags":
             if isinstance(parsed, list):
                 return normalize_list([str(item or "").strip() for item in parsed])
         elif isinstance(parsed, str):
             return str(parsed or "")
 
+    if source_field_name == CHAT_EVENT_DIALOGUE_FIELD_NAME:
+        return {
+            "role": "",
+            "content": str(fallback_text or ""),
+        }
     if source_field_name == "tags":
         return normalize_list(str(fallback_text or "").split("，"))
     return str(fallback_text or "")
@@ -641,7 +751,7 @@ def build_sqlite_entry_row(entry: dict[str, Any]) -> dict[str, Any]:
             "title": str(entry.get("title") or ""),
             "short_summary": str(entry.get("short_summary") or ""),
             "detailed_summary": "",
-            "raw_dialogue": str(entry.get("raw_dialogue") or ""),
+            "raw_dialogue": dump_raw_dialogue(entry.get("raw_dialogue")),
             "reference_doc_path": str(entry.get("reference_doc_path") or ""),
             "tags_json": dump_json_string_list(entry.get("tags")),
             "source_paths_json": dump_json_string_list(entry.get("source_paths")),
@@ -661,11 +771,15 @@ def build_sqlite_entry_row(entry: dict[str, Any]) -> dict[str, Any]:
     if normalized_memory_kind == "field_record":
         normalized_source_field_name = str(entry.get("source_field_name") or "").strip()
         field_value = resolve_field_record_value(entry, normalized_source_field_name)
+        if normalized_source_field_name == CHAT_EVENT_DIALOGUE_FIELD_NAME:
+            source_field_value_text = str(entry.get("source_field_value_text") or "").strip()
+        else:
+            source_field_value_text = render_field_record_value_text(field_value)
         return {
             **base_row,
             "source_memory_id": str(entry.get("source_memory_id") or "").strip(),
             "source_field_name": normalized_source_field_name,
-            "source_field_value_text": render_field_record_value_text(field_value),
+            "source_field_value_text": source_field_value_text,
             "source_field_value_json": dump_field_record_value_json(field_value),
         }
     raise RuntimeError(f"Unsupported memory_kind for SQLite row conversion: {normalized_memory_kind}")
@@ -688,7 +802,7 @@ def build_entry_from_sqlite_row(row: sqlite3.Row | dict[str, Any]) -> dict[str, 
     if normalized_memory_kind == "field_record":
         source_field_name = str(row_data.get("source_field_name") or "").strip()
         field_value = resolve_field_record_value(row_data, source_field_name)
-        return {
+        field_entry = {
             **common_entry,
             "title": "",
             "short_summary": "",
@@ -708,8 +822,10 @@ def build_entry_from_sqlite_row(row: sqlite3.Row | dict[str, Any]) -> dict[str, 
             "retrieval_fields": [source_field_name] if source_field_name else [],
             "source_field_value_text": str(row_data.get("source_field_value_text") or ""),
             "source_field_value_json": str(row_data.get("source_field_value_json") or ""),
-            source_field_name: field_value,
         }
+        if source_field_name != CHAT_EVENT_DIALOGUE_FIELD_NAME:
+            field_entry[source_field_name] = field_value
+        return field_entry
     if normalized_memory_kind == "project_registry" and not normalized_short_summary:
         normalized_short_summary = build_short_summary(
             title=normalized_title,
@@ -726,7 +842,7 @@ def build_entry_from_sqlite_row(row: sqlite3.Row | dict[str, Any]) -> dict[str, 
         "short_summary": normalized_short_summary,
         "overview_summary": normalized_overview_summary,
         "detailed_summary": normalized_detailed_summary,
-        "raw_dialogue": str(row_data.get("raw_dialogue") or "") if normalized_memory_kind == "chat_event" else "",
+        "raw_dialogue": load_raw_dialogue(row_data.get("raw_dialogue")) if normalized_memory_kind == "chat_event" else "",
         "problem_background": str(row_data.get("problem_background") or ""),
         "analysis": str(row_data.get("analysis") or ""),
         "action_steps": str(row_data.get("action_steps") or ""),
@@ -1224,6 +1340,8 @@ def build_detail_record_from_sqlite_row(row: sqlite3.Row | dict[str, Any]) -> di
             record["tags"] = load_json_string_list(value)
         elif field_name == "source_paths_json":
             record["source_paths"] = load_json_string_list(value)
+        elif field_name == "raw_dialogue" and record["memory_kind"] == "chat_event":
+            record["raw_dialogue"] = load_raw_dialogue(value)
         else:
             record[field_name] = str(value or "")
     if record["memory_kind"] == "project_registry":
@@ -1444,11 +1562,11 @@ def delete_field_records_by_source_and_fields(
     normalized_field_name_set = {
         str(field_name or "").strip()
         for field_name in field_names
-        if str(field_name or "").strip() in FIELD_RECORD_CANDIDATE_FIELDS
+        if str(field_name or "").strip() in SUPPORTED_FIELD_RECORD_SOURCE_FIELDS
     }
     normalized_field_names = [
         field_name
-        for field_name in FIELD_RECORD_CANDIDATE_FIELDS
+        for field_name in SUPPORTED_FIELD_RECORD_SOURCE_FIELDS
         if field_name in normalized_field_name_set
     ]
     if not normalized_source_memory_id or not normalized_field_names:
@@ -1473,6 +1591,33 @@ def delete_field_records_by_source_and_fields(
     finally:
         if owned_connection:
             db.close()
+
+
+def fetch_field_record_ids_by_source_and_fields(
+    source_memory_id: str,
+    field_names: list[str] | tuple[str, ...] | set[str],
+    connection: sqlite3.Connection,
+) -> list[str]:
+    normalized_source_memory_id = str(source_memory_id or "").strip()
+    normalized_field_names = [
+        field_name
+        for field_name in SUPPORTED_FIELD_RECORD_SOURCE_FIELDS
+        if field_name in {str(item or "").strip() for item in field_names}
+    ]
+    if not normalized_source_memory_id or not normalized_field_names:
+        return []
+    placeholders = ",".join("?" for _ in normalized_field_names)
+    rows = connection.execute(
+        f"""
+        SELECT id
+        FROM field_records
+        WHERE source_memory_id = ?
+          AND source_field_name IN ({placeholders})
+        ORDER BY id
+        """,
+        [normalized_source_memory_id, *normalized_field_names],
+    ).fetchall()
+    return [str(row["id"] or "").strip() for row in rows if str(row["id"] or "").strip()]
 
 
 # 从 SQLite 中读取一批指定 id 的记录，并保持调用方传入的 id 顺序。
@@ -1700,9 +1845,193 @@ def normalize_text_block(value: str | None) -> str:
     return "\n".join(non_empty_lines).strip()
 
 
-# raw_dialogue 是回源用的原始对话正文；只统一换行和外层空白，内部角色、段落和空行保持不变。
-def normalize_raw_dialogue(value: str | None) -> str:
-    return str(value or "").replace("\r\n", "\n").replace("\r", "\n").strip()
+def normalize_json_metadata(value: dict[str, Any], field_path: str) -> dict[str, Any]:
+    try:
+        return json.loads(json.dumps(value, ensure_ascii=False, allow_nan=False))
+    except (TypeError, ValueError, RecursionError) as exc:
+        raise ValueError(f"{field_path} must contain only JSON-serializable values") from exc
+
+
+def select_matched_message_ids(message_scores: dict[str, tuple[float, int]]) -> list[str]:
+    """Rank message anchors independently of the parent record's other fields."""
+    ranked = sorted(
+        ((message_id, score, index) for message_id, (score, index) in message_scores.items() if math.isfinite(score)),
+        key=lambda item: (-item[1], item[2], item[0]),
+    )
+    if not ranked:
+        return []
+    best_score = ranked[0][1]
+    # FAISS scores are float32; tolerate their rounding at the inclusive boundary.
+    return [
+        message_id for message_id, score, _ in ranked
+        if best_score - score <= MESSAGE_SCORE_GAP
+        or (MESSAGE_SCORE_GAP > 0 and math.isclose(best_score - score, MESSAGE_SCORE_GAP, rel_tol=0.0, abs_tol=1e-7))
+    ][:MAX_TOTAL_MESSAGES]
+
+
+def build_dialogue_context(
+    dialogue: Any, matched_message_ids: list[str] | None = None
+) -> dict[str, Any]:
+    """Build an output-only view; never change the stored dialogue or its messages."""
+    if not isinstance(dialogue, dict) or not isinstance(dialogue.get("messages"), list):
+        raise ValueError("raw_dialogue is not structured; request full_dialogue=true to read it.")
+    messages = dialogue["messages"]
+    positions = {message["message_id"]: index for index, message in enumerate(messages)}
+    requested = list(dict.fromkeys(matched_message_ids or []))
+    unresolved = [message_id for message_id in requested if message_id not in positions]
+    valid = [message_id for message_id in requested if message_id in positions]
+    anchors = valid[:MAX_TOTAL_MESSAGES]
+    selected = {positions[message_id] for message_id in anchors}
+    if anchors:
+        mode = "matched_context"
+        reason = "matched_messages"
+        for distance in range(1, min(RETURN_MESSAGE_NUM, len(messages)) + 1):
+            if len(selected) >= MAX_TOTAL_MESSAGES:
+                break
+            for message_id in anchors:
+                center = positions[message_id]
+                for index in (center - distance, center + distance):
+                    if len(selected) < MAX_TOTAL_MESSAGES and 0 <= index < len(messages):
+                        selected.add(index)
+    else:
+        mode = "tail_preview"
+        reason = "anchors_not_found" if requested else "no_anchors"
+        count = min(2 * RETURN_MESSAGE_NUM + 1, MAX_TOTAL_MESSAGES)
+        selected = set(range(max(0, len(messages) - count), len(messages)))
+
+    output: list[dict[str, Any]] = []
+
+    def append_omission(count: int) -> None:
+        if count:
+            output.append({
+                "type": "omission",
+                "omitted_count": count,
+                "content": f"[... 省略 {count} 条消息 ...]",
+            })
+
+    previous = -1
+    for index in sorted(selected):
+        append_omission(index - previous - 1)
+        output.append(dict(messages[index]))
+        previous = index
+    append_omission(len(messages) - previous - 1)
+    return {
+        **dialogue,
+        "messages": output,
+        "context": {
+            "mode": mode,
+            "reason": reason,
+            "total_messages": len(messages),
+            "returned_messages": len(selected),
+            "truncated": len(selected) < len(messages),
+            "anchor_message_ids": anchors,
+            "unresolved_message_ids": unresolved,
+            "omitted_anchor_count": len(valid) - len(anchors),
+        },
+    }
+
+
+# 结构化对话是 chat_event 的主数据；legacy 字符串只允许内部兼容读取，不能再从新接口写入。
+def normalize_raw_dialogue(
+    value: Any,
+    *,
+    allow_legacy: bool = False,
+) -> str | dict[str, Any]:
+    if not isinstance(value, dict):
+        legacy_text = str(value or "").replace("\r\n", "\n").replace("\r", "\n").strip()
+        if legacy_text and not allow_legacy:
+            raise ValueError("raw_dialogue must be a structured object with a non-empty messages array")
+        return legacy_text
+
+    if "context" in value:
+        raise ValueError(
+            "raw_dialogue is a read-only context view and cannot be saved or updated; "
+            "request full_dialogue=true before replacing the complete dialogue."
+        )
+    unsupported_top_level_fields = set(value) - {"schema_version", "messages", "metadata"}
+    if unsupported_top_level_fields:
+        unsupported_text = ", ".join(sorted(str(item) for item in unsupported_top_level_fields))
+        raise ValueError(f"raw_dialogue contains unsupported fields: {unsupported_text}")
+
+    raw_schema_version = value.get("schema_version", CHAT_DIALOGUE_SCHEMA_VERSION)
+    if raw_schema_version != CHAT_DIALOGUE_SCHEMA_VERSION:
+        raise ValueError(f"raw_dialogue.schema_version must be {CHAT_DIALOGUE_SCHEMA_VERSION}")
+
+    raw_messages = value.get("messages")
+    if not isinstance(raw_messages, list) or not raw_messages:
+        raise ValueError("raw_dialogue.messages must be a non-empty array")
+
+    raw_top_level_metadata = value.get("metadata")
+    if raw_top_level_metadata is not None and not isinstance(raw_top_level_metadata, dict):
+        raise ValueError("raw_dialogue.metadata must be an object when provided")
+
+    normalized_messages: list[dict[str, Any]] = []
+    seen_message_ids: set[str] = set()
+    for message_index, raw_message in enumerate(raw_messages):
+        if not isinstance(raw_message, dict):
+            raise ValueError(f"raw_dialogue.messages[{message_index}] must be an object")
+        unsupported_message_fields = set(raw_message) - {
+            "message_id",
+            "role",
+            "content",
+            "timestamp",
+            "metadata",
+        }
+        if unsupported_message_fields:
+            unsupported_text = ", ".join(sorted(str(item) for item in unsupported_message_fields))
+            raise ValueError(
+                f"raw_dialogue.messages[{message_index}] contains unsupported fields: {unsupported_text}"
+            )
+
+        role = str(raw_message.get("role") or "").strip().lower()
+        if role not in CHAT_DIALOGUE_ROLES:
+            raise ValueError(
+                f"raw_dialogue.messages[{message_index}].role must be one of: {', '.join(CHAT_DIALOGUE_ROLES)}"
+            )
+        content = str(raw_message.get("content") or "").replace("\r\n", "\n").replace("\r", "\n").strip()
+        if not content:
+            raise ValueError(f"raw_dialogue.messages[{message_index}].content must not be empty")
+        timestamp = str(raw_message.get("timestamp") or "").strip()
+        raw_message_metadata = raw_message.get("metadata")
+        if raw_message_metadata is not None and not isinstance(raw_message_metadata, dict):
+            raise ValueError(f"raw_dialogue.messages[{message_index}].metadata must be an object when provided")
+
+        message_id = str(raw_message.get("message_id") or "").strip()
+        if not message_id:
+            id_seed = json.dumps(
+                [message_index, role, content, timestamp],
+                ensure_ascii=False,
+                separators=(",", ":"),
+            )
+            message_id = f"msg-{hashlib.sha256(id_seed.encode('utf-8')).hexdigest()[:12]}"
+        if message_id in seen_message_ids:
+            raise ValueError(f"raw_dialogue contains duplicate message_id: {message_id}")
+        seen_message_ids.add(message_id)
+
+        normalized_message: dict[str, Any] = {
+            "message_id": message_id,
+            "role": role,
+            "content": content,
+        }
+        if timestamp:
+            normalized_message["timestamp"] = timestamp
+        if raw_message_metadata:
+            normalized_message["metadata"] = normalize_json_metadata(
+                raw_message_metadata,
+                f"raw_dialogue.messages[{message_index}].metadata",
+            )
+        normalized_messages.append(normalized_message)
+
+    normalized_dialogue: dict[str, Any] = {
+        "schema_version": CHAT_DIALOGUE_SCHEMA_VERSION,
+        "messages": normalized_messages,
+    }
+    if raw_top_level_metadata:
+        normalized_dialogue["metadata"] = normalize_json_metadata(
+            raw_top_level_metadata,
+            "raw_dialogue.metadata",
+        )
+    return normalized_dialogue
 
 
 # 尝试把字符串形式的 JSON 数组解析成字符串列表。
@@ -1982,18 +2311,89 @@ def build_fallback_tags(memory_kind: StoredMemoryKind, title: str, detailed_summ
     return generated
 
 
-# 为 save/update 的成功返回生成统一的 fact 提取提醒对象；调用方看到它后再自行判断是否值得继续提取 fact。
-def build_fact_extraction_reminder() -> dict[str, Any]:
-    return {
-        "decision_by_caller": True,
-        "message": "这条非 fact 记忆写入成功后，是否还值得继续提取长期可复用 fact，由调用方判断；优先关注个人长期事实，而不是把已经写清的项目排查和解决过程再重复沉淀成 fact。",
-        "recommended_steps": [
-            "先判断这条记忆里是否真的包含长期可复用、跨会话稳定、会持续影响回答的事实；如果只是项目问题的完整排查与解决链路，且 project_record 已经写清，通常不需要再额外提取 fact。",
-            "若包含，先 search 相近 fact。",
-            "若存在语义相近 fact，优先 update。",
-            "若不存在相近 fact，再 save 新 fact。",
-        ],
-    }
+def resolve_embedding_model_max_tokens(tokenizer: Any, model_path: str) -> int:
+    candidates: list[int] = []
+    tokenizer_model_max_length = getattr(tokenizer, "model_max_length", None)
+    try:
+        parsed_tokenizer_limit = int(tokenizer_model_max_length or 0)
+    except (TypeError, ValueError, OverflowError):
+        parsed_tokenizer_limit = 0
+    if 0 < parsed_tokenizer_limit < 1_000_000:
+        candidates.append(parsed_tokenizer_limit)
+
+    model_dir = Path(str(model_path or "").strip())
+    metadata_fields = (
+        ("sentence_bert_config.json", "max_seq_length"),
+        ("tokenizer_config.json", "model_max_length"),
+        ("config.json", "max_position_embeddings"),
+    )
+    for relative_name, field_name in metadata_fields:
+        target_path = model_dir / relative_name
+        if not target_path.is_file():
+            continue
+        try:
+            parsed_metadata = json.loads(target_path.read_text(encoding="utf-8"))
+            parsed_limit = int(parsed_metadata.get(field_name) or 0)
+        except (OSError, json.JSONDecodeError, TypeError, ValueError, OverflowError):
+            continue
+        if 0 < parsed_limit < 1_000_000:
+            candidates.append(parsed_limit)
+
+    if not candidates:
+        raise RuntimeError(
+            "Cannot determine the embedding model token limit from the tokenizer or model metadata."
+        )
+    return min(candidates)
+
+
+def split_dialogue_message_content(
+    role: str,
+    content: str,
+    tokenizer: Any,
+    model_path: str,
+) -> list[str]:
+    model_max_tokens = resolve_embedding_model_max_tokens(tokenizer, model_path)
+    effective_max_tokens = min(CHAT_EVENT_CHUNK_MAX_TOKENS, model_max_tokens)
+    try:
+        special_token_count = int(tokenizer.num_special_tokens_to_add(pair=False))
+    except (AttributeError, TypeError, ValueError):
+        special_token_count = 0
+    prefix = f"{role}: "
+    prefix_token_ids = list(tokenizer.encode(prefix, add_special_tokens=False, verbose=False))
+    content_token_ids = list(tokenizer.encode(content, add_special_tokens=False, verbose=False))
+    content_token_limit = effective_max_tokens - special_token_count - len(prefix_token_ids)
+    if content_token_limit <= 0:
+        raise RuntimeError(
+            "chat_event_chunk_max_tokens is too small for the current tokenizer's role prefix and special tokens"
+        )
+    if CHAT_EVENT_CHUNK_OVERLAP_TOKENS >= content_token_limit:
+        raise RuntimeError(
+            "chat_event_chunk_overlap_tokens must be smaller than the effective dialogue content token limit"
+        )
+    if len(content_token_ids) <= content_token_limit:
+        return [content]
+
+    chunks: list[str] = []
+    step = content_token_limit - CHAT_EVENT_CHUNK_OVERLAP_TOKENS
+    for start_index in range(0, len(content_token_ids), step):
+        chunk_token_ids = content_token_ids[start_index : start_index + content_token_limit]
+        if not chunk_token_ids:
+            break
+        chunk_text = str(
+            tokenizer.decode(
+                chunk_token_ids,
+                skip_special_tokens=True,
+                clean_up_tokenization_spaces=False,
+            )
+            or ""
+        ).strip()
+        if chunk_text:
+            chunks.append(chunk_text)
+        if start_index + content_token_limit >= len(content_token_ids):
+            break
+    if not chunks:
+        raise RuntimeError("The embedding tokenizer produced no usable chunks for a dialogue message")
+    return chunks
 
 
 # 按字段类型把 field_record 的单字段值规范化成最终存储形态。
@@ -2010,7 +2410,10 @@ def normalize_field_record_field_value(field_name: str, raw_value: Any) -> str |
 
 # 从现有 field_record 中提取“真正属于 source_field_name 的值”。
 # 当前 field_record 只有最小必要字段，source_field_value_json/source_field_value_text 就是唯一事实源。
-def resolve_field_record_value(entry: dict[str, Any], source_field_name: str) -> str | list[str]:
+def resolve_field_record_value(
+    entry: dict[str, Any],
+    source_field_name: str,
+) -> str | list[str] | dict[str, Any]:
     minimal_json_value = entry.get("source_field_value_json")
     return load_field_record_value_json(source_field_name, minimal_json_value, entry.get("source_field_value_text"))
 
@@ -2053,6 +2456,108 @@ def build_one_hot_field_record_entry(
         "source_memory_id": source_memory_id,
         "source_field_name": source_field_name,
         **payload,
+    }
+
+
+def build_chat_dialogue_field_record_entries(
+    source_entry: dict[str, Any],
+    tokenizer: Any,
+    model_path: str,
+) -> list[dict[str, Any]]:
+    if str(source_entry.get("memory_kind") or "").strip() != "chat_event":
+        return []
+    raw_dialogue = source_entry.get("raw_dialogue")
+    if not isinstance(raw_dialogue, dict):
+        return []
+
+    source_memory_id = str(source_entry.get("id") or "").strip()
+    if not source_memory_id:
+        raise ValueError("chat_event dialogue field records require a source memory id")
+    raw_messages = raw_dialogue.get("messages")
+    if not isinstance(raw_messages, list):
+        raise ValueError("structured raw_dialogue must contain a messages array")
+
+    created_at = str(source_entry.get("created_at") or "").strip()
+    updated_at = str(source_entry.get("updated_at") or "").strip()
+    field_entries: list[dict[str, Any]] = []
+    for message_index, message in enumerate(raw_messages):
+        if not isinstance(message, dict):
+            raise ValueError(f"raw_dialogue.messages[{message_index}] must be an object")
+        message_id = str(message.get("message_id") or "").strip()
+        role = str(message.get("role") or "").strip()
+        content = str(message.get("content") or "")
+        chunks = split_dialogue_message_content(role, content, tokenizer, model_path)
+        chunk_count = len(chunks)
+        for chunk_index, chunk_text in enumerate(chunks):
+            segment_payload = {
+                "message_id": message_id,
+                "role": role,
+                "message_index": message_index,
+                "chunk_index": chunk_index,
+                "chunk_count": chunk_count,
+                "content": chunk_text,
+            }
+            field_entries.append(
+                build_chat_dialogue_field_record_entry(
+                    source_memory_id=source_memory_id,
+                    segment_payload=segment_payload,
+                    created_at=created_at,
+                    updated_at=updated_at,
+                )
+            )
+    return field_entries
+
+
+# 构造一条消息切片子记录；plural 生成器和内部记录规范化共用它，保证 ID 与检索文本一致。
+def build_chat_dialogue_field_record_entry(
+    source_memory_id: str,
+    segment_payload: dict[str, Any],
+    created_at: str,
+    updated_at: str,
+) -> dict[str, Any]:
+    message_id = str(segment_payload.get("message_id") or "").strip()
+    role = str(segment_payload.get("role") or "").strip()
+    content = str(segment_payload.get("content") or "").strip()
+    try:
+        message_index = int(segment_payload.get("message_index"))
+        chunk_index = int(segment_payload.get("chunk_index"))
+        chunk_count = int(segment_payload.get("chunk_count"))
+    except (TypeError, ValueError) as exc:
+        raise RuntimeError("dialogue field_record indices must be integers") from exc
+    if not source_memory_id or not message_id or role not in CHAT_DIALOGUE_ROLES or not content:
+        raise RuntimeError("dialogue field_record contains invalid source, message, role or content")
+    if message_index < 0 or chunk_index < 0 or chunk_count <= 0 or chunk_index >= chunk_count:
+        raise RuntimeError("dialogue field_record contains invalid message or chunk indices")
+
+    normalized_segment_payload = {
+        "message_id": message_id,
+        "role": role,
+        "message_index": message_index,
+        "chunk_index": chunk_index,
+        "chunk_count": chunk_count,
+        "content": content,
+    }
+    return {
+        "id": build_dialogue_field_record_id(source_memory_id, message_id, chunk_index),
+        "memory_kind": "field_record",
+        "title": "",
+        "short_summary": "",
+        "problem_background": "",
+        "analysis": "",
+        "action_steps": "",
+        "validation_result": "",
+        "detailed_summary": "",
+        "raw_dialogue": "",
+        "tags": [],
+        "source_paths": [],
+        "reference_doc_path": "",
+        "retrieval_fields": [CHAT_EVENT_DIALOGUE_FIELD_NAME],
+        "source_memory_id": source_memory_id,
+        "source_field_name": CHAT_EVENT_DIALOGUE_FIELD_NAME,
+        "source_field_value_text": f"{role}: {content}",
+        "source_field_value_json": dump_field_record_value_json(normalized_segment_payload),
+        "created_at": created_at,
+        "updated_at": updated_at,
     }
 
 
@@ -2114,8 +2619,10 @@ def build_retrieval_fields(entry: dict[str, Any]) -> list[str]:
     memory_kind = str(entry.get("memory_kind") or "").strip()
     if memory_kind == "field_record":
         source_field_name = str(entry.get("source_field_name") or "").strip()
-        if source_field_name not in FIELD_RECORD_CANDIDATE_FIELDS:
+        if source_field_name not in SUPPORTED_FIELD_RECORD_SOURCE_FIELDS:
             return []
+        if source_field_name == CHAT_EVENT_DIALOGUE_FIELD_NAME:
+            return [source_field_name] if collapse_text(entry.get("source_field_value_text")) else []
         field_value = resolve_field_record_value(entry, source_field_name)
         return [source_field_name] if field_value else []
     field_candidates = get_retrieval_field_candidates_for_memory_kind(memory_kind)
@@ -2136,8 +2643,10 @@ def build_retrieval_fields(entry: dict[str, Any]) -> list[str]:
 def build_retrieval_text(entry: dict[str, Any]) -> str:
     if str(entry.get("memory_kind") or "").strip() == "field_record":
         source_field_name = str(entry.get("source_field_name") or "").strip()
-        if source_field_name not in FIELD_RECORD_CANDIDATE_FIELDS:
+        if source_field_name not in SUPPORTED_FIELD_RECORD_SOURCE_FIELDS:
             return ""
+        if source_field_name == CHAT_EVENT_DIALOGUE_FIELD_NAME:
+            return str(entry.get("source_field_value_text") or "")
         field_value = resolve_field_record_value(entry, source_field_name)
         if isinstance(field_value, list):
             return "，".join(field_value)
@@ -2185,7 +2694,7 @@ def build_payload(
     title: str,
     detailed_summary: str | None = None,
     short_summary: str | None = None,
-    raw_dialogue: str | None = None,
+    raw_dialogue: Any = None,
     overview_summary: str | None = None,
     problem_background: str | None = None,
     analysis: str | None = None,
@@ -2198,6 +2707,7 @@ def build_payload(
     strict_project_requirements: bool = True,
     require_short_summary: bool = True,
     validate_reference_doc_path: bool = True,
+    allow_legacy_raw_dialogue: bool = False,
 ) -> dict[str, Any]:
     resolved_memory_kind = normalize_memory_kind(memory_kind)
     resolved_title = collapse_text(title)
@@ -2207,7 +2717,10 @@ def build_payload(
     resolved_action_steps = normalize_text_block(action_steps)
     resolved_validation_result = normalize_text_block(validation_result)
     resolved_detailed_summary = normalize_text_block(detailed_summary)
-    resolved_raw_dialogue = normalize_raw_dialogue(raw_dialogue)
+    resolved_raw_dialogue = normalize_raw_dialogue(
+        raw_dialogue,
+        allow_legacy=allow_legacy_raw_dialogue,
+    )
     resolved_project_id = collapse_text(project_id)
     resolved_source_paths = normalize_list(coerce_source_path_list_input(source_paths))
     resolved_reference_doc_path = resolve_reference_doc_path(
@@ -2313,6 +2826,18 @@ def build_field_record_id(source_memory_id: str, source_field_name: str) -> str:
     return f"fmem-{hashlib.sha256(id_seed.encode('utf-8')).hexdigest()[:12]}"
 
 
+def build_dialogue_field_record_id(
+    source_memory_id: str,
+    message_id: str,
+    chunk_index: int,
+) -> str:
+    id_seed = (
+        f"{source_memory_id}|{CHAT_EVENT_DIALOGUE_FIELD_NAME}|"
+        f"{message_id}|{int(chunk_index)}"
+    )
+    return f"fmem-{hashlib.sha256(id_seed.encode('utf-8')).hexdigest()[:12]}"
+
+
 # 把主数据中的单条记录规范成当前正式 schema。
 # 输入必须已经是当前字段口径；这个函数负责统一正文、检索字段、id 和时间字段。
 def normalize_store_entry(entry: dict[str, Any]) -> dict[str, Any]:
@@ -2348,6 +2873,19 @@ def normalize_store_entry(entry: dict[str, Any]) -> dict[str, Any]:
         field_value = resolve_field_record_value(entry, normalized_source_field_name)
         if not field_value:
             raise RuntimeError("field_record entries must contain a non-empty source field value")
+        if normalized_source_field_name == CHAT_EVENT_DIALOGUE_FIELD_NAME:
+            if not isinstance(field_value, dict):
+                raise RuntimeError("dialogue field_record must contain a structured source field value")
+            normalized_dialogue_field_entry = build_chat_dialogue_field_record_entry(
+                source_memory_id=normalized_source_memory_id,
+                segment_payload=field_value,
+                created_at=normalized_created_at,
+                updated_at=normalized_updated_at,
+            )
+            provided_id = str(entry.get("id") or "").strip()
+            if provided_id and provided_id != normalized_dialogue_field_entry["id"]:
+                raise RuntimeError("dialogue field_record id does not match its source payload")
+            return normalized_dialogue_field_entry
         return build_one_hot_field_record_entry(
             source_memory_id=normalized_source_memory_id,
             source_field_name=normalized_source_field_name,
@@ -2361,7 +2899,7 @@ def normalize_store_entry(entry: dict[str, Any]) -> dict[str, Any]:
         title=str(raw_title or ""),
         detailed_summary=str(raw_detailed_summary or ""),
         short_summary=str(raw_short_summary or ""),
-        raw_dialogue=str(raw_raw_dialogue or ""),
+        raw_dialogue=raw_raw_dialogue,
         overview_summary=str(raw_overview_summary or ""),
         problem_background=str(raw_problem_background or ""),
         analysis=str(raw_analysis or ""),
@@ -2374,6 +2912,7 @@ def normalize_store_entry(entry: dict[str, Any]) -> dict[str, Any]:
         strict_project_requirements=False,
         require_short_summary=False,
         validate_reference_doc_path=False,
+        allow_legacy_raw_dialogue=True,
     )
 
     
@@ -2445,6 +2984,7 @@ def build_update_candidate_record(source_entry: dict[str, Any], changes: dict[st
         tags=payload_inputs.get("tags"),
         source_paths=payload_inputs.get("source_paths"),
         reference_doc_path=payload_inputs.get("reference_doc_path"),
+        allow_legacy_raw_dialogue="raw_dialogue" not in changes,
     )
     
 
@@ -2458,7 +2998,11 @@ def build_update_candidate_record(source_entry: dict[str, Any], changes: dict[st
 
 # 从一条主记忆派生一批 field_record；这批记录只进入主数据和索引层，不作为对外可直接维护的对象。
 # 输入是单条主记忆 dict；输出是 list[dict[str, Any]]，每一项都带 source_memory_id/source_field_name，用于后续 search 折叠回源。
-def build_field_record_entries(source_entry: dict[str, Any]) -> list[dict[str, Any]]:
+def build_field_record_entries(
+    source_entry: dict[str, Any],
+    dialogue_tokenizer: Any | None = None,
+    model_path: str | None = None,
+) -> list[dict[str, Any]]:
     if is_field_record_entry(source_entry):
         return []
 
@@ -2471,6 +3015,19 @@ def build_field_record_entries(source_entry: dict[str, Any]) -> list[dict[str, A
         field_entry = build_field_record_entry_for_field(source_entry, field_name)
         if field_entry is not None:
             field_entries.append(field_entry)
+    if (
+        str(source_entry.get("memory_kind") or "").strip() == "chat_event"
+        and isinstance(source_entry.get("raw_dialogue"), dict)
+    ):
+        resolved_model_path = model_path or resolve_embed_model_path()
+        resolved_tokenizer = dialogue_tokenizer or get_embedding_tokenizer(resolved_model_path)
+        field_entries.extend(
+            build_chat_dialogue_field_record_entries(
+                source_entry,
+                resolved_tokenizer,
+                resolved_model_path,
+            )
+        )
     return field_entries
 
 
@@ -2680,14 +3237,18 @@ def build_rebuild_state_snapshot(
     last_error: str = "",
     target_entry_count: int = 0,
     worker_pid: int = 0,
+    index_refresh_reason: str = "",
+    missing_entry_count: int = 0,
 ) -> dict[str, Any]:
     return {
         "state": str(state or "").strip() or "idle",
         "mode": str(mode or "").strip(),
+        "index_refresh_reason": str(index_refresh_reason or "").strip(),
         "started_at": str(started_at or "").strip(),
         "finished_at": str(finished_at or "").strip(),
         "last_error": str(last_error or "").strip(),
         "target_entry_count": int(target_entry_count or 0),
+        "missing_entry_count": int(missing_entry_count or 0),
         "worker_pid": int(worker_pid or 0),
     }
 
@@ -2775,10 +3336,12 @@ def load_rebuild_state() -> dict[str, Any]:
     snapshot = build_rebuild_state_snapshot(
         state=str(raw_snapshot.get("state") or "idle"),
         mode=str(raw_snapshot.get("mode") or ""),
+        index_refresh_reason=str(raw_snapshot.get("index_refresh_reason") or ""),
         started_at=str(raw_snapshot.get("started_at") or ""),
         finished_at=str(raw_snapshot.get("finished_at") or ""),
         last_error=str(raw_snapshot.get("last_error") or ""),
         target_entry_count=int(raw_snapshot.get("target_entry_count") or 0),
+        missing_entry_count=int(raw_snapshot.get("missing_entry_count") or 0),
         worker_pid=int(raw_snapshot.get("worker_pid") or 0),
     )
     worker_pid = int(snapshot.get("worker_pid") or 0)
@@ -2792,10 +3355,12 @@ def load_rebuild_state() -> dict[str, Any]:
         failed_snapshot = build_rebuild_state_snapshot(
             state="failed",
             mode=str(snapshot.get("mode") or BACKGROUND_REBUILD_MODE),
+            index_refresh_reason=str(snapshot.get("index_refresh_reason") or ""),
             started_at=str(snapshot.get("started_at") or ""),
             finished_at=now_iso(),
             last_error="Previous process exited while background index rebuild was still running.",
             target_entry_count=int(snapshot.get("target_entry_count") or 0),
+            missing_entry_count=int(snapshot.get("missing_entry_count") or 0),
             worker_pid=os.getpid(),
         )
         write_rebuild_state(failed_snapshot)
@@ -2833,26 +3398,41 @@ def load_current_index_stats() -> dict[str, int]:
 
 
 # 为 save/update 的异步慢路径生成统一的返回片段；它明确告诉调用方主数据已写入，但 search 需要等后台重建完成。
-def build_background_rebuild_notice() -> dict[str, Any]:
-    return {
+def build_background_rebuild_notice(
+    index_refresh_reason: str = "cache_unavailable",
+    missing_entry_count: int = 0,
+) -> dict[str, Any]:
+    notice = {
         "index_refresh_state": "rebuilding",
         "index_refresh_mode": BACKGROUND_REBUILD_MODE,
+        "index_refresh_reason": str(index_refresh_reason or "").strip(),
         "search_available": False,
         "message": "主数据已写入，向量索引正在后台重建；重建完成前 search 不可用。",
     }
+    if missing_entry_count:
+        notice["missing_entry_count"] = int(missing_entry_count)
+    return notice
 
 
 # 在当前 MCP 进程里后台执行一次完整索引重建；它只读最新 SQLite 主数据，并把索引侧文件补齐到一致状态。
-def run_background_full_rebuild(started_at: str, model_path: str, target_entry_count: int) -> None:
+def run_background_full_rebuild(
+    started_at: str,
+    model_path: str,
+    target_entry_count: int,
+    index_refresh_reason: str = "cache_unavailable",
+    missing_entry_count: int = 0,
+) -> None:
     try:
         rebuild_stats = rebuild_vector_index(model_path=model_path)
         write_rebuild_state(
             build_rebuild_state_snapshot(
                 state="idle",
                 mode=BACKGROUND_REBUILD_MODE,
+                index_refresh_reason=index_refresh_reason,
                 started_at=started_at,
                 finished_at=now_iso(),
                 target_entry_count=int(rebuild_stats.get("count") or target_entry_count),
+                missing_entry_count=missing_entry_count,
                 worker_pid=os.getpid(),
             )
         )
@@ -2861,17 +3441,24 @@ def run_background_full_rebuild(started_at: str, model_path: str, target_entry_c
             build_rebuild_state_snapshot(
                 state="failed",
                 mode=BACKGROUND_REBUILD_MODE,
+                index_refresh_reason=index_refresh_reason,
                 started_at=started_at,
                 finished_at=now_iso(),
                 last_error=f"{type(exc).__name__}: {exc}",
                 target_entry_count=target_entry_count,
+                missing_entry_count=missing_entry_count,
                 worker_pid=os.getpid(),
             )
         )
 
 
 # 启动后台全量重建线程，并立刻返回给前台请求一个“主数据已写入、索引仍在补齐”的结构化提醒。
-def launch_background_full_rebuild(model_path: str, target_entry_count: int) -> dict[str, Any]:
+def launch_background_full_rebuild(
+    model_path: str,
+    target_entry_count: int,
+    index_refresh_reason: str = "cache_unavailable",
+    missing_entry_count: int = 0,
+) -> dict[str, Any]:
     global _BACKGROUND_REBUILD_THREAD
 
     with _BACKGROUND_REBUILD_LOCK:
@@ -2883,15 +3470,23 @@ def launch_background_full_rebuild(model_path: str, target_entry_count: int) -> 
         running_snapshot = build_rebuild_state_snapshot(
             state="running",
             mode=BACKGROUND_REBUILD_MODE,
+            index_refresh_reason=index_refresh_reason,
             started_at=started_at,
             target_entry_count=target_entry_count,
+            missing_entry_count=missing_entry_count,
             worker_pid=os.getpid(),
         )
         write_rebuild_state(running_snapshot)
 
         worker = threading.Thread(
             target=run_background_full_rebuild,
-            args=(started_at, model_path, target_entry_count),
+            args=(
+                started_at,
+                model_path,
+                target_entry_count,
+                index_refresh_reason,
+                missing_entry_count,
+            ),
             name="memory-rag-mcp-background-rebuild",
             daemon=True,
         )
@@ -2901,17 +3496,19 @@ def launch_background_full_rebuild(model_path: str, target_entry_count: int) -> 
             failed_snapshot = build_rebuild_state_snapshot(
                 state="failed",
                 mode=BACKGROUND_REBUILD_MODE,
+                index_refresh_reason=index_refresh_reason,
                 started_at=started_at,
                 finished_at=now_iso(),
                 last_error=f"Failed to start background rebuild thread: {exc}",
                 target_entry_count=target_entry_count,
+                missing_entry_count=missing_entry_count,
                 worker_pid=os.getpid(),
             )
             write_rebuild_state(failed_snapshot)
             raise RuntimeError("Failed to start background index rebuild.") from exc
 
         _BACKGROUND_REBUILD_THREAD = worker
-    return build_background_rebuild_notice()
+    return build_background_rebuild_notice(index_refresh_reason, missing_entry_count)
 
 
 # 以原子方式写本地 embedding 缓存矩阵，保证向量缓存不会在中途写坏。
@@ -3131,6 +3728,11 @@ def get_embedder(model_path: str, device: str) -> Any:
     return load_sentence_embedder(model_path, device=device)
 
 
+@lru_cache(maxsize=2)
+def get_embedding_tokenizer(model_path: str) -> Any:
+    return load_embedding_tokenizer(model_path)
+
+
 # 把文本批量编码成归一化后的 float32 向量，供 FAISS 使用。
 def encode_texts(texts: list[str], embedder: Any) -> np.ndarray:
     embeddings = embedder.encode(
@@ -3188,6 +3790,7 @@ def write_vector_meta(
         "dim": int(dim),
         "normalized": True,
         "retrieval_field_signature": RETRIEVAL_FIELD_SIGNATURE,
+        "field_record_derivation_signature": FIELD_RECORD_DERIVATION_SIGNATURE,
         "row_to_id": list(entry_ids),
     }
     write_json_atomic(META_PATH, meta)
@@ -3199,48 +3802,75 @@ def write_vector_meta(
 # 因为模型身份属于这次请求上下文，不应该在这个下层函数里再重复扫描模型目录生成一次。
 # retrieval_field_signature 继续直接读取模块级常量 RETRIEVAL_FIELD_SIGNATURE，
 # 因为它代表的是当前代码的字段拼接规则，不是每次请求单独生成的数据。
-def load_reusable_embedding_cache(embedding_model_fingerprint: str) -> tuple[np.ndarray, list[str]] | None:
+def load_reusable_embedding_cache_with_reason(
+    embedding_model_fingerprint: str,
+) -> tuple[tuple[np.ndarray, list[str]] | None, str]:
     if not EMBEDDINGS_PATH.exists() or not META_PATH.exists():
-        return None
+        return None, "cache_unavailable"
 
     try:
         with EMBEDDINGS_PATH.open("rb") as handle:
             embeddings = np.load(handle, allow_pickle=False)
     except (OSError, ValueError):
-        return None
+        return None, "cache_unavailable"
 
     if not isinstance(embeddings, np.ndarray) or embeddings.ndim != 2:
-        return None
+        return None, "payload_invalid"
 
     try:
         with META_PATH.open("r", encoding="utf-8") as handle:
             meta = json.load(handle)
     except (OSError, json.JSONDecodeError):
-        return None
+        return None, "cache_unavailable"
 
     if not isinstance(meta, dict):
-        return None
+        return None, "payload_invalid"
     if str(meta.get("embedding_model_fingerprint") or "").strip() != str(embedding_model_fingerprint or "").strip():
-        return None
+        return None, "signature_mismatch"
     if str(meta.get("retrieval_field_signature") or "") != RETRIEVAL_FIELD_SIGNATURE:
-        return None
+        return None, "signature_mismatch"
+    if str(meta.get("field_record_derivation_signature") or "") != FIELD_RECORD_DERIVATION_SIGNATURE:
+        return None, "signature_mismatch"
 
     row_to_id = meta.get("row_to_id")
     if not isinstance(row_to_id, list):
-        return None
+        return None, "payload_invalid"
     if not all(isinstance(row_item, str) and str(row_item or "").strip() for row_item in row_to_id):
-        return None
+        return None, "payload_invalid"
     row_ids = [str(row_item or "").strip() for row_item in row_to_id]
 
     normalized_embeddings = np.asarray(embeddings, dtype="float32")
     if normalized_embeddings.shape[0] != len(row_ids):
-        return None
+        return None, "payload_invalid"
 
     dim = int(meta.get("dim") or 0)
     if not dim or normalized_embeddings.shape[1] != dim:
-        return None
+        return None, "payload_invalid"
 
-    return normalized_embeddings, row_ids
+    return (normalized_embeddings, row_ids), ""
+
+
+def load_reusable_embedding_cache(embedding_model_fingerprint: str) -> tuple[np.ndarray, list[str]] | None:
+    cache_state, _ = load_reusable_embedding_cache_with_reason(embedding_model_fingerprint)
+    return cache_state
+
+
+def collect_missing_indexable_payloads(
+    current_entry_ids: list[str],
+    cached_vector_by_id: dict[str, np.ndarray],
+    pending_entry_ids: set[str] | None = None,
+) -> tuple[list[tuple[str, dict[str, Any], str]], list[str]]:
+    known_entry_ids = set(cached_vector_by_id)
+    known_entry_ids.update(pending_entry_ids or set())
+    missing_entry_ids = [
+        entry_id
+        for entry_id in current_entry_ids
+        if entry_id and entry_id not in known_entry_ids
+    ]
+    if not missing_entry_ids:
+        return [], []
+    missing_entries = fetch_store_entries_by_ids(missing_entry_ids)
+    return build_indexable_entry_payloads(missing_entries), missing_entry_ids
 
 
 # update_store_and_rebuild、rebuild_vector_index 和增量缓存路径都通过这里把向量缓存与索引产物同步写盘。
@@ -3274,6 +3904,36 @@ def rebuild_index_from_embeddings(
     return {"count": len(entry_ids), "dim": dim}
 
 
+# 全量索引重建前从公开主数据重新派生 field_record，确保切片配置变化后不会混用旧子记录。
+def regenerate_all_field_records_for_current_policy(
+    model_path: str,
+    dialogue_tokenizer: Any | None = None,
+) -> None:
+    ensure_sqlite_store_ready()
+    with closing(get_sqlite_connection()) as connection:
+        rows = connection.execute(
+            f"""
+            SELECT {', '.join(SQLITE_ENTRY_COLUMNS)}, source_field_value_text, source_field_value_json
+            FROM {PUBLIC_MEMORY_VIEW}
+            ORDER BY {SQLITE_ENTRY_ORDER_BY}
+            """
+        ).fetchall()
+        public_entries = [build_entry_from_sqlite_row(row) for row in rows]
+        regenerated_field_entries: list[dict[str, Any]] = []
+        for public_entry in public_entries:
+            regenerated_field_entries.extend(
+                build_field_record_entries(
+                    public_entry,
+                    dialogue_tokenizer=dialogue_tokenizer,
+                    model_path=model_path,
+                )
+            )
+        connection.execute("DELETE FROM field_records")
+        if regenerated_field_entries:
+            upsert_field_record_rows(regenerated_field_entries, connection=connection)
+        connection.commit()
+
+
 # 首次建库和缓存自愈
 # 上层函数 update_store_and_rebuild 通过这里执行“重新编码全部记录”的完整后门
 def rebuild_vector_index(
@@ -3284,6 +3944,11 @@ def rebuild_vector_index(
     resolved_model_path = model_path or resolve_embed_model_path()
     current_embedding_model_fingerprint = build_embedding_model_fingerprint(resolved_model_path)
     if entries is None:
+        dialogue_tokenizer = getattr(embedder, "tokenizer", None) if embedder is not None else None
+        regenerate_all_field_records_for_current_policy(
+            resolved_model_path,
+            dialogue_tokenizer=dialogue_tokenizer,
+        )
         ordered_entry_ids: list[str] = []
         embedding_batches: list[np.ndarray] = []
         resolved_embedder = embedder
@@ -3358,6 +4023,7 @@ def update_store_and_rebuild(
     updated_field_names: set[str] | list[str] | tuple[str, ...] | None = None,  # 告诉函数“这次 update 真正改了哪些业务字段”，方便把 field_record 收窄成字段级增量
 ) -> dict[str, Any]:
     ensure_sqlite_store_ready()
+    resolved_model_path = model_path or resolve_embed_model_path()
     normalized_appended_entry = normalize_store_entry(appended_entry) if appended_entry is not None else None
     normalized_previous_entry = previous_entry if previous_entry is not None else None
     normalized_updated_entry = normalize_store_entry(updated_entry) if updated_entry is not None else None
@@ -3372,6 +4038,15 @@ def update_store_and_rebuild(
         for field_name in set(updated_field_names or set())
         if str(field_name or "").strip()
     }
+    needs_dialogue_tokenizer = any(
+        entry is not None
+        and str(entry.get("memory_kind") or "").strip() == "chat_event"
+        and isinstance(entry.get("raw_dialogue"), dict)
+        for entry in (normalized_appended_entry, normalized_updated_entry)
+    )
+    dialogue_tokenizer = getattr(embedder, "tokenizer", None) if embedder is not None else None
+    if needs_dialogue_tokenizer and dialogue_tokenizer is None:
+        dialogue_tokenizer = get_embedding_tokenizer(resolved_model_path)
     background_rebuild_notice: dict[str, Any] | None = None
     deleted_source_ids_for_field_cleanup = set(deleted_id_set)
     updated_field_record_delta = {
@@ -3399,7 +4074,13 @@ def update_store_and_rebuild(
         # 不再在事务提交前另开 SQLite 连接回读主记忆，避免读到旧版本或读不到新插入记录。
         refreshed_field_entries: list[dict[str, Any]] = []
         if normalized_appended_entry is not None and not is_field_record_entry(normalized_appended_entry):
-            refreshed_field_entries.extend(build_field_record_entries(normalized_appended_entry))
+            refreshed_field_entries.extend(
+                build_field_record_entries(
+                    normalized_appended_entry,
+                    dialogue_tokenizer=dialogue_tokenizer,
+                    model_path=resolved_model_path,
+                )
+            )
         if (
             normalized_updated_entry is not None
             and normalized_previous_entry is not None
@@ -3425,22 +4106,49 @@ def update_store_and_rebuild(
                 )
                 if saved_field_entry is not None:
                     updated_field_record_entries_for_vector.append(saved_field_entry)
+            if CHAT_EVENT_DIALOGUE_FIELD_NAME in normalized_updated_field_names:
+                removed_dialogue_field_record_ids = fetch_field_record_ids_by_source_and_fields(
+                    updated_source_memory_id,
+                    {CHAT_EVENT_DIALOGUE_FIELD_NAME},
+                    connection=connection,
+                )
+                delete_field_records_by_source_and_fields(
+                    updated_source_memory_id,
+                    {CHAT_EVENT_DIALOGUE_FIELD_NAME},
+                    connection=connection,
+                )
+                rebuilt_dialogue_field_entries = build_chat_dialogue_field_record_entries(
+                    normalized_updated_entry,
+                    dialogue_tokenizer,
+                    resolved_model_path,
+                )
+                if rebuilt_dialogue_field_entries:
+                    upsert_store_entries(rebuilt_dialogue_field_entries, connection=connection)
+                    updated_field_record_entries_for_vector.extend(rebuilt_dialogue_field_entries)
+                updated_field_record_delta["removed_field_record_ids"].extend(
+                    removed_dialogue_field_record_ids
+                )
         elif normalized_updated_entry is not None and not is_field_record_entry(normalized_updated_entry):
             if normalized_updated_source_ids:
                 delete_field_records_by_source_ids(list(normalized_updated_source_ids), connection=connection)
-            refreshed_field_entries.extend(build_field_record_entries(normalized_updated_entry))
+            refreshed_field_entries.extend(
+                build_field_record_entries(
+                    normalized_updated_entry,
+                    dialogue_tokenizer=dialogue_tokenizer,
+                    model_path=resolved_model_path,
+                )
+            )
             updated_field_record_entries_for_vector = list(refreshed_field_entries)
         if refreshed_field_entries:
             upsert_store_entries(refreshed_field_entries, connection=connection)
         connection.commit()
 
     current_entry_ids = fetch_ordered_store_entry_ids()
+    current_entry_id_set = set(current_entry_ids)
     public_timeline_entries = fetch_public_timeline_summary_entries(limit=3)
 
     # 写盘：主数据已经先落 SQLite；这里同步重写人类可读时间线。
     write_text_atomic(TIMELINE_PATH, build_timeline_markdown_from_batches(iter_public_entries_for_timeline()))
-    # 获取模型目录
-    resolved_model_path = model_path or resolve_embed_model_path()
     current_embedding_model_fingerprint = build_embedding_model_fingerprint(resolved_model_path)
 
     # 开始更新后续的 .npy / .faiss / meta 文件。
@@ -3466,7 +4174,9 @@ def update_store_and_rebuild(
         #   1. 已经算好的向量矩阵（numpy）
         #   2. 向量矩阵每一行对应的记录 id 顺序（row-to-id）
         # 后续 新增 / 删除 分支都会优先复用这份缓存。
-        cached_embedding_state = load_reusable_embedding_cache(current_embedding_model_fingerprint)
+        cached_embedding_state, cache_rejection_reason = load_reusable_embedding_cache_with_reason(
+            current_embedding_model_fingerprint
+        )
 
         # save 的增量路径（当新增记录时执行的代码）：
         #   1. 只对新增记录生成 retrieval_text 并做一次 embedding
@@ -3509,6 +4219,8 @@ def update_store_and_rebuild(
                     background_rebuild_notice = launch_background_full_rebuild(
                         resolved_model_path,
                         len(current_entry_ids),
+                        "payload_invalid",
+                        missing_entry_count=len(new_entry_ids),
                     )
                     rebuild_stats = load_current_index_stats()
                 else:
@@ -3537,6 +4249,8 @@ def update_store_and_rebuild(
                 background_rebuild_notice = launch_background_full_rebuild(
                     resolved_model_path,
                     len(current_entry_ids),
+                    "missing_ids",
+                    missing_entry_count=len(new_entry_ids),
                 )
                 rebuild_stats = load_current_index_stats()
         # 删除链路的缓存复用路径：
@@ -3579,6 +4293,7 @@ def update_store_and_rebuild(
                 background_rebuild_notice = launch_background_full_rebuild(
                     resolved_model_path,
                     len(current_entry_ids),
+                    "missing_ids",
                 )
                 rebuild_stats = load_current_index_stats()
         # update 的精确增量路径：
@@ -3595,12 +4310,42 @@ def update_store_and_rebuild(
                 for record_id in updated_field_record_delta["removed_field_record_ids"]
                 if str(record_id or "").strip()
             ]
-            reencoded_entries = [normalized_updated_entry, *updated_field_record_entries_for_vector]
+            main_retrieval_text_changed = (
+                normalized_previous_entry is None
+                or build_retrieval_text(normalized_previous_entry)
+                != build_retrieval_text(normalized_updated_entry)
+            )
+            reencoded_entries = list(updated_field_record_entries_for_vector)
+            if main_retrieval_text_changed:
+                reencoded_entries.insert(0, normalized_updated_entry)
             reencoded_entry_payloads = build_indexable_entry_payloads(reencoded_entries)
             reencoded_entry_id_set = {entry_id for entry_id, _, _ in reencoded_entry_payloads}
             for removed_id in removed_field_record_ids:
                 cached_vector_by_id.pop(removed_id, None)
-            if all(
+            missing_entry_payloads, missing_entry_ids = collect_missing_indexable_payloads(
+                current_entry_ids,
+                cached_vector_by_id,
+                reencoded_entry_id_set,
+            )
+            if len(missing_entry_payloads) == len(missing_entry_ids):
+                reencoded_entry_payloads.extend(missing_entry_payloads)
+                reencoded_entry_id_set.update(
+                    entry_id for entry_id, _, _ in missing_entry_payloads
+                )
+            stale_cached_entry_ids = [
+                entry_id
+                for entry_id in cached_vector_by_id
+                if entry_id not in current_entry_id_set
+            ]
+            if stale_cached_entry_ids:
+                background_rebuild_notice = launch_background_full_rebuild(
+                    resolved_model_path,
+                    len(current_entry_ids),
+                    "missing_ids",
+                    missing_entry_count=len(stale_cached_entry_ids),
+                )
+                rebuild_stats = load_current_index_stats()
+            elif all(
                 entry_id and (entry_id in cached_vector_by_id or entry_id in reencoded_entry_id_set)
                 for entry_id in current_entry_ids
             ):
@@ -3627,6 +4372,8 @@ def update_store_and_rebuild(
                 background_rebuild_notice = launch_background_full_rebuild(
                     resolved_model_path,
                     len(current_entry_ids),
+                    "payload_invalid" if missing_entry_ids else "missing_ids",
+                    missing_entry_count=len(missing_entry_ids),
                 )
                 rebuild_stats = load_current_index_stats()
         else:
@@ -3636,6 +4383,7 @@ def update_store_and_rebuild(
             background_rebuild_notice = launch_background_full_rebuild(
                 resolved_model_path,
                 len(current_entry_ids),
+                cache_rejection_reason or "missing_ids",
             )
             rebuild_stats = load_current_index_stats()
 
