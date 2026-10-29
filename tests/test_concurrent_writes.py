@@ -8,10 +8,11 @@ import sys
 import tempfile
 import time
 import unittest
-from contextlib import AsyncExitStack
+from contextlib import AsyncExitStack, asynccontextmanager
 from datetime import timedelta
 from pathlib import Path
 from typing import Any
+from unittest.mock import patch
 
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
@@ -64,17 +65,23 @@ class StdioSessionPool:
             **self.extra_env,
         }
         self.stderr_sink = open(os.devnull, "w", encoding="utf-8")
-        for _ in range(self.size):
-            params = StdioServerParameters(
-                command=str(PYTHON),
-                args=[str(WORKER)],
-                env=env,
-                cwd=str(ROOT),
-            )
-            streams = await self.stack.enter_async_context(stdio_client(params, errlog=self.stderr_sink))
-            session = await self.stack.enter_async_context(ClientSession(*streams))
-            await session.initialize()
-            self.sessions.append(session)
+        try:
+            for _ in range(self.size):
+                params = StdioServerParameters(
+                    command=str(PYTHON),
+                    args=["-u", str(WORKER)],
+                    env=env,
+                    cwd=str(ROOT),
+                )
+                streams = await self.stack.enter_async_context(stdio_client(params, errlog=self.stderr_sink))
+                session = await self.stack.enter_async_context(
+                    ClientSession(*streams, read_timeout_seconds=timedelta(seconds=20))
+                )
+                await session.initialize()
+                self.sessions.append(session)
+        except BaseException:
+            await self.__aexit__(*sys.exc_info())
+            raise
         deadline = time.monotonic() + 5
         while time.monotonic() < deadline:
             if self.pid_log_path.exists():
@@ -137,6 +144,45 @@ class StdioSessionPool:
         return await asyncio.gather(
             *(self.call(index, tool_name, arguments) for index, (tool_name, arguments) in enumerate(calls))
         )
+
+
+class StdioSessionPoolTests(unittest.TestCase):
+    def test_failed_initialization_closes_session_streams_and_log(self) -> None:
+        closed = {"streams": False, "session": False}
+
+        @asynccontextmanager
+        async def fake_stdio(params, errlog):
+            self.assertEqual(params.args, ["-u", str(WORKER)])
+            try:
+                yield (object(), object())
+            finally:
+                closed["streams"] = True
+
+        class FailedSession:
+            def __init__(self, *streams, read_timeout_seconds):
+                self.timeout = read_timeout_seconds
+
+            async def __aenter__(self):
+                return self
+
+            async def initialize(self):
+                if self.timeout != timedelta(seconds=20):
+                    raise AssertionError("initialization must have a read timeout")
+                raise TimeoutError("initialization timed out")
+
+            async def __aexit__(self, *exc):
+                closed["session"] = True
+
+        with tempfile.TemporaryDirectory() as directory:
+            async def check() -> None:
+                pool = StdioSessionPool(Path(directory), 1)
+                with self.assertRaisesRegex(TimeoutError, "initialization timed out"):
+                    async with pool:
+                        self.fail("failed initialization entered the pool")
+                self.assertIsNone(pool.stderr_sink)
+            with patch.object(sys.modules[__name__], "stdio_client", fake_stdio), patch.object(sys.modules[__name__], "ClientSession", FailedSession):
+                asyncio.run(check())
+        self.assertEqual(closed, {"streams": True, "session": True})
 
 
 class CrossProcessWriteTests(unittest.TestCase):

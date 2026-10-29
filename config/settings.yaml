@@ -46,6 +46,7 @@ search:
   max_top_k: 20 # 搜索接口允许返回的最大条数。
   min_similarity: null # 实体级最低相似度阈值；null 表示关闭过滤。
   message_score_gap: 0.2 # 同一聊天记录内，相对最高分消息的最大分差，包含边界。
+  message_top_k: 3 # 每条聊天记忆的代表消息上限；search 可单次覆盖，锚点位置距离须大于 returnMessageNum。
 
 # 检索文本拼接规则。
 retrieval:
@@ -75,7 +76,6 @@ retrieval:
 # 对外结果字段裁剪规则。
 results:
   returnMessageNum: 10 # 命中消息前后各扩展的消息条数，不是一问一答的轮数。
-  max_total_messages: 40 # 默认详情每条聊天记录的真实消息上限；省略项不占额度。
   search_fields: # search 默认返回的轻量字段。
     - id
     - memory_kind

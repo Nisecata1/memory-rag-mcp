@@ -36,10 +36,29 @@ if str(CURRENT_DIR) not in sys.path:
 
 from embedding_utils import l2_normalize, load_embedding_tokenizer, load_sentence_embedder
 
+import memory_domain
+from memory_store import (
+    ALL_MEMORY_VIEW,
+    DETAIL_COLUMNS_BY_MEMORY_KIND,
+    DETAIL_MEMORY_KIND_BY_ID_PREFIX,
+    DETAIL_TABLE_BY_MEMORY_KIND,
+    PUBLIC_MEMORY_VIEW,
+    SQLITE_ENTRY_COLUMNS,
+    SQLITE_ENTRY_ORDER_BY,
+    SQLITE_FIELD_RECORD_COLUMNS,
+    SQLITE_LIGHT_DETAIL_COLUMNS,
+    SQLITE_PROJECT_DETAIL_COLUMNS,
+    SQLITE_PROJECT_REGISTRY_COLUMNS,
+    SQLITE_REBUILD_BATCH_SIZE,
+    SQLITE_REGISTRY_COLUMNS,
+    SQLITE_SCHEMA_VERSION,
+)
+from memory_store import SQLiteMemoryStore, StorePolicy, StoreTransaction, unwrap_connection
+
+
 
 CONFIG_DIR = CURRENT_DIR / "config"  # 项目配置目录。
 CONFIG_PATH = CONFIG_DIR / "settings.yaml"  # 项目 YAML 配置文件。
-SQLITE_SCHEMA_VERSION = 4  # SQLite 主数据层自己的 schema 版本；和 memory.store_version 分开维护。
 
 
 # 把 YAML 配置里的路径值解析成当前项目可直接使用的绝对路径；相对路径一律相对脚本文件所在目录。
@@ -140,7 +159,7 @@ def load_project_config() -> dict[str, Any]:
     if max_top_k <= 0:
         raise RuntimeError(f"search.max_top_k in {CONFIG_PATH.name} must be a positive integer.")
     min_similarity = parse_min_similarity(search_config.get("min_similarity"))
-    message_score_gap, return_message_num, max_total_messages = parse_dialogue_return_config(
+    message_score_gap, return_message_num, message_top_k = parse_dialogue_return_config(
         search_config, results_config
     )
 
@@ -203,7 +222,7 @@ def load_project_config() -> dict[str, Any]:
         "min_similarity": min_similarity,
         "message_score_gap": message_score_gap,
         "return_message_num": return_message_num,
-        "max_total_messages": max_total_messages,
+        "message_top_k": message_top_k,
         "chat_event_chunk_max_tokens": chat_event_chunk_max_tokens,
         "chat_event_chunk_overlap_tokens": chat_event_chunk_overlap_tokens,
         "retrieval_field_candidates": normalized_field_candidates,
@@ -219,11 +238,12 @@ def parse_dialogue_return_config(
     if isinstance(gap, bool) or not isinstance(gap, (int, float)) or not math.isfinite(gap) or gap < 0:
         raise RuntimeError("search.message_score_gap must be a non-negative finite number.")
     radius = results_config.get("returnMessageNum", 10)
-    limit = results_config.get("max_total_messages", 40)
-    for name, value, minimum in (("returnMessageNum", radius, 0), ("max_total_messages", limit, 1)):
-        if isinstance(value, bool) or not isinstance(value, int) or value < minimum:
-            raise RuntimeError(f"results.{name} must be an integer >= {minimum}.")
-    return float(gap), radius, limit
+    if type(radius) is not int or radius < 0:
+        raise RuntimeError("results.returnMessageNum must be an integer >= 0.")
+    message_top_k = search_config.get("message_top_k", 3)
+    if type(message_top_k) is not int or message_top_k <= 0:
+        raise RuntimeError("search.message_top_k must be a positive integer.")
+    return float(gap), radius, message_top_k
 
 
 def parse_min_similarity(value: Any) -> float | None:
@@ -266,7 +286,7 @@ MAX_TOP_K = PROJECT_CONFIG["max_top_k"]  # 搜索结果最大返回条数。
 SEARCH_MIN_SIMILARITY = PROJECT_CONFIG["min_similarity"]  # 实体级最低相似度阈值；None 表示关闭。
 MESSAGE_SCORE_GAP = PROJECT_CONFIG["message_score_gap"]
 RETURN_MESSAGE_NUM = PROJECT_CONFIG["return_message_num"]
-MAX_TOTAL_MESSAGES = PROJECT_CONFIG["max_total_messages"]
+MESSAGE_TOP_K = PROJECT_CONFIG["message_top_k"]
 CHAT_EVENT_CHUNK_MAX_TOKENS = PROJECT_CONFIG["chat_event_chunk_max_tokens"]
 CHAT_EVENT_CHUNK_OVERLAP_TOKENS = PROJECT_CONFIG["chat_event_chunk_overlap_tokens"]
 TAG_FALLBACK_LIMIT = PROJECT_CONFIG["tag_fallback_limit"]  # 服务端兜底标签的最大数量。
@@ -358,133 +378,6 @@ REBUILD_STALE_GRACE_SECONDS = 30.0  # 跨 stdio 进程读取 running 状态时�
 _BACKGROUND_REBUILD_LOCK = threading.Lock()  # 同一进程内的后台重建串行锁。
 _BACKGROUND_REBUILD_THREAD: threading.Thread | None = None  # 当前进程里正在运行的后台重建线程引用。
 _SQLITE_INIT_LOCK = threading.Lock()  # 同一进程内串行初始化 SQLite，避免首次启动时重复建表或重复迁移。
-SQLITE_REBUILD_BATCH_SIZE = 200  # SQLite 全量重建时每批读取的记录数，避免一次性堆太多检索文本。
-SQLITE_ENTRY_ORDER_BY = "updated_at DESC, created_at DESC, id DESC"  # SQLite 取当前稳定顺序时沿用现有 Python 排序口径。
-SQLITE_ENTRY_COLUMNS = (
-    "id",
-    "memory_kind",
-    "title",
-    "short_summary",
-    "overview_summary",
-    "detailed_summary",
-    "raw_dialogue",
-    "problem_background",
-    "analysis",
-    "action_steps",
-    "validation_result",
-    "reference_doc_path",
-    "project_id",
-    "created_at",
-    "updated_at",
-    "source_memory_id",
-    "source_field_name",
-    "tags_json",
-    "source_paths_json",
-    "retrieval_fields_json",
-)  # SQLite 主表完整列顺序；读写转换都统一沿用这一份定义。
-SQLITE_REGISTRY_COLUMNS = (
-    "id",
-    "memory_kind",
-    "created_at",
-    "updated_at",
-)
-SQLITE_PROJECT_DETAIL_COLUMNS = (
-    "id",
-    "title",
-    "short_summary",
-    "detailed_summary",
-    "problem_background",
-    "analysis",
-    "action_steps",
-    "validation_result",
-    "reference_doc_path",
-    "tags_json",
-    "source_paths_json",
-    "retrieval_fields_json",
-)
-SQLITE_PROJECT_REGISTRY_COLUMNS = (
-    "id",
-    "title",
-    "overview_summary",
-    "reference_doc_path",
-    "project_id",
-    "tags_json",
-    "source_paths_json",
-    "retrieval_fields_json",
-)
-SQLITE_LIGHT_DETAIL_COLUMNS = (
-    "id",
-    "title",
-    "short_summary",
-    "detailed_summary",
-    "reference_doc_path",
-    "tags_json",
-    "source_paths_json",
-    "retrieval_fields_json",
-)
-SQLITE_FIELD_RECORD_COLUMNS = (
-    "id",
-    "source_memory_id",
-    "source_field_name",
-    "source_field_value_text",
-    "source_field_value_json",
-    "created_at",
-    "updated_at",
-)
-PUBLIC_MEMORY_VIEW = "public_memory_view"
-ALL_MEMORY_VIEW = "all_memory_view"
-DETAIL_MEMORY_KIND_BY_ID_PREFIX = (
-    ("projRegisterMemId-", "project_registry"),
-    ("projRegId-", "project_registry"),
-    ("projMemId-", "project_record"),
-    ("eventMemId-", "chat_event"),
-    ("factMemId-", "fact"),
-    ("proj-", "project_registry"),
-)
-DETAIL_TABLE_BY_MEMORY_KIND = {
-    "project_record": "project_records",
-    "chat_event": "chat_events",
-    "fact": "facts",
-    "project_registry": "project_registry",
-}
-DETAIL_COLUMNS_BY_MEMORY_KIND = {
-    "project_record": (
-        "title",
-        "short_summary",
-        "detailed_summary",
-        "problem_background",
-        "analysis",
-        "action_steps",
-        "validation_result",
-        "reference_doc_path",
-        "project_id",
-        "tags_json",
-        "source_paths_json",
-    ),
-    "chat_event": (
-        "title",
-        "short_summary",
-        "raw_dialogue",
-        "reference_doc_path",
-        "tags_json",
-        "source_paths_json",
-    ),
-    "fact": (
-        "title",
-        "short_summary",
-        "detailed_summary",
-        "reference_doc_path",
-        "tags_json",
-        "source_paths_json",
-    ),
-    "project_registry": (
-        "title",
-        "overview_summary",
-        "reference_doc_path",
-        "tags_json",
-        "source_paths_json",
-    ),
-}
 
 # 类型声明上这是 Literal[...]，也就是“只允许固定几个字符串字面量”的类型；运行时拿到的数据类型仍然是 str，例如 "fact"。
 # 对外 save / update 这类工具里的 memory_kind 只能传 "project_record"、"chat_event" 或 "fact"；最终进代码时就是这三个字符串之一，不是别的对象类型。
@@ -601,1090 +494,193 @@ def serialized_write(function):
 
 
 # 打开一条 SQLite 连接，并统一设置本项目需要的基础 PRAGMA。
+def get_memory_store() -> SQLiteMemoryStore:
+    return SQLiteMemoryStore(
+        SQLITE_PATH,
+        StorePolicy(
+            normalize_list=normalize_list,
+            normalize_raw_dialogue=normalize_raw_dialogue,
+            normalize_record_ids=normalize_record_ids,
+            build_short_summary=build_short_summary,
+            collapse_text=collapse_text,
+            sort_entries=sort_entries,
+            build_indexable_entry_payloads=build_indexable_entry_payloads,
+            is_field_record_entry=is_field_record_entry,
+            supported_field_names=SUPPORTED_FIELD_RECORD_SOURCE_FIELDS,
+        ),
+        directories=(AI_MEMORY_DIR, DATA_DIR),
+        init_lock=_SQLITE_INIT_LOCK,
+        schema_version=SQLITE_SCHEMA_VERSION,
+    )
+
+
 def get_sqlite_connection() -> sqlite3.Connection:
-    ensure_memory_dir()
-    connection = sqlite3.connect(str(SQLITE_PATH))
-    connection.row_factory = sqlite3.Row
-    connection.execute("PRAGMA journal_mode=WAL")
-    connection.execute("PRAGMA synchronous=NORMAL")
-    connection.execute("PRAGMA busy_timeout=5000")
-    return connection
+    return get_memory_store().get_sqlite_connection()
 
 
 # 把字符串列表编码成 SQLite 里存储用的 JSON 文本。
 def dump_json_string_list(values: list[str] | None) -> str:
-    return json.dumps(normalize_list(values), ensure_ascii=False)
+    return get_memory_store().dump_json_string_list(values)
 
 
 # 把 SQLite 里的 JSON 文本还原成字符串列表，并在异常时安全退回空列表。
 def load_json_string_list(value: Any) -> list[str]:
-    if value is None:
-        return []
-    if isinstance(value, list):
-        return normalize_list([str(item or "").strip() for item in value])
-
-    raw_text = str(value or "").strip()
-    if not raw_text:
-        return []
-    try:
-        parsed = json.loads(raw_text)
-    except json.JSONDecodeError:
-        return []
-    if not isinstance(parsed, list):
-        return []
-    return normalize_list([str(item or "").strip() for item in parsed])
+    return get_memory_store().load_json_string_list(value)
 
 
 # 把结构化新对话编码成 JSON；legacy 字符串保持原样，避免隐式迁移历史正文。
 def dump_raw_dialogue(value: str | dict[str, Any] | None) -> str:
-    if isinstance(value, dict):
-        return json.dumps(value, ensure_ascii=False, separators=(",", ":"))
-    return str(value or "")
+    return get_memory_store().dump_raw_dialogue(value)
 
 
 def load_raw_dialogue(value: Any) -> str | dict[str, Any]:
-    raw_text = str(value or "")
-    if not raw_text.strip():
-        return ""
-    try:
-        parsed = json.loads(raw_text)
-    except json.JSONDecodeError:
-        return raw_text
-    if not isinstance(parsed, dict):
-        return raw_text
-    try:
-        normalized = normalize_raw_dialogue(parsed, allow_legacy=False)
-    except ValueError:
-        return raw_text
-    return normalized if isinstance(normalized, dict) else raw_text
+    return get_memory_store().load_raw_dialogue(value)
 
 
 # 把 field_record 的单字段值编码成 SQLite 可直接保存的 JSON 文本。
 def dump_field_record_value_json(field_value: str | list[str] | dict[str, Any]) -> str:
-    if isinstance(field_value, dict):
-        return json.dumps(field_value, ensure_ascii=False, separators=(",", ":"))
-    if isinstance(field_value, list):
-        return json.dumps(normalize_list(field_value), ensure_ascii=False)
-    return json.dumps(str(field_value or ""), ensure_ascii=False)
+    return get_memory_store().dump_field_record_value_json(field_value)
 
 
 # 把 field_record 的单字段值渲染成检索文本，供 source_field_value_text 落盘。
 def render_field_record_value_text(field_value: str | list[str] | dict[str, Any]) -> str:
-    if isinstance(field_value, dict):
-        role = str(field_value.get("role") or "").strip()
-        content = str(field_value.get("content") or "")
-        return f"{role}: {content}" if role else content
-    if isinstance(field_value, list):
-        return "，".join(normalize_list(field_value))
-    return str(field_value or "")
+    return get_memory_store().render_field_record_value_text(field_value)
 
 
 # 从 SQLite 里的 JSON 文本恢复 field_record 的真实字段值。
-def load_field_record_value_json(
-    source_field_name: str,
-    json_text: Any,
-    fallback_text: Any,
-) -> str | list[str] | dict[str, Any]:
-    raw_json_text = str(json_text or "").strip()
-    if raw_json_text:
-        try:
-            parsed = json.loads(raw_json_text)
-        except json.JSONDecodeError:
-            parsed = None
-        if source_field_name == CHAT_EVENT_DIALOGUE_FIELD_NAME:
-            if isinstance(parsed, dict):
-                return parsed
-        elif source_field_name == "tags":
-            if isinstance(parsed, list):
-                return normalize_list([str(item or "").strip() for item in parsed])
-        elif isinstance(parsed, str):
-            return str(parsed or "")
-
-    if source_field_name == CHAT_EVENT_DIALOGUE_FIELD_NAME:
-        return {
-            "role": "",
-            "content": str(fallback_text or ""),
-        }
-    if source_field_name == "tags":
-        return normalize_list(str(fallback_text or "").split("，"))
-    return str(fallback_text or "")
+def load_field_record_value_json(source_field_name: str, json_text: Any, fallback_text: Any) -> str | list[str] | dict[str, Any]:
+    return get_memory_store().load_field_record_value_json(source_field_name, json_text, fallback_text)
 
 
 # 把一条规范化后的主数据记录转换成 SQLite 参数字典。
 def build_sqlite_entry_row(entry: dict[str, Any]) -> dict[str, Any]:
-    normalized_memory_kind = str(entry.get("memory_kind") or "").strip()
-    base_row = {
-        "id": str(entry.get("id") or "").strip(),
-        "memory_kind": normalized_memory_kind,
-        "created_at": str(entry.get("created_at") or "").strip(),
-        "updated_at": str(entry.get("updated_at") or "").strip(),
-    }
-    if normalized_memory_kind == "project_record":
-        return {
-            **base_row,
-            "title": str(entry.get("title") or ""),
-            "short_summary": str(entry.get("short_summary") or ""),
-            "detailed_summary": str(entry.get("detailed_summary") or ""),
-            "problem_background": str(entry.get("problem_background") or ""),
-            "analysis": str(entry.get("analysis") or ""),
-            "action_steps": str(entry.get("action_steps") or ""),
-            "validation_result": str(entry.get("validation_result") or ""),
-            "reference_doc_path": str(entry.get("reference_doc_path") or ""),
-            "project_id": str(entry.get("project_id") or "").strip() or None,
-            "tags_json": dump_json_string_list(entry.get("tags")),
-            "source_paths_json": dump_json_string_list(entry.get("source_paths")),
-            "retrieval_fields_json": dump_json_string_list(entry.get("retrieval_fields")),
-        }
-    if normalized_memory_kind == "project_registry":
-        return {
-            **base_row,
-            "title": str(entry.get("title") or ""),
-            "overview_summary": str(entry.get("overview_summary") or ""),
-            "reference_doc_path": str(entry.get("reference_doc_path") or ""),
-            "tags_json": dump_json_string_list(entry.get("tags")),
-            "source_paths_json": dump_json_string_list(entry.get("source_paths")),
-            "retrieval_fields_json": dump_json_string_list(entry.get("retrieval_fields")),
-        }
-    if normalized_memory_kind == "chat_event":
-        return {
-            **base_row,
-            "title": str(entry.get("title") or ""),
-            "short_summary": str(entry.get("short_summary") or ""),
-            "detailed_summary": "",
-            "raw_dialogue": dump_raw_dialogue(entry.get("raw_dialogue")),
-            "reference_doc_path": str(entry.get("reference_doc_path") or ""),
-            "tags_json": dump_json_string_list(entry.get("tags")),
-            "source_paths_json": dump_json_string_list(entry.get("source_paths")),
-            "retrieval_fields_json": dump_json_string_list(entry.get("retrieval_fields")),
-        }
-    if normalized_memory_kind == "fact":
-        return {
-            **base_row,
-            "title": str(entry.get("title") or ""),
-            "short_summary": str(entry.get("short_summary") or ""),
-            "detailed_summary": str(entry.get("detailed_summary") or ""),
-            "reference_doc_path": str(entry.get("reference_doc_path") or ""),
-            "tags_json": dump_json_string_list(entry.get("tags")),
-            "source_paths_json": dump_json_string_list(entry.get("source_paths")),
-            "retrieval_fields_json": dump_json_string_list(entry.get("retrieval_fields")),
-        }
-    if normalized_memory_kind == "field_record":
-        normalized_source_field_name = str(entry.get("source_field_name") or "").strip()
-        field_value = resolve_field_record_value(entry, normalized_source_field_name)
-        if normalized_source_field_name == CHAT_EVENT_DIALOGUE_FIELD_NAME:
-            source_field_value_text = str(entry.get("source_field_value_text") or "").strip()
-        else:
-            source_field_value_text = render_field_record_value_text(field_value)
-        return {
-            **base_row,
-            "source_memory_id": str(entry.get("source_memory_id") or "").strip(),
-            "source_field_name": normalized_source_field_name,
-            "source_field_value_text": source_field_value_text,
-            "source_field_value_json": dump_field_record_value_json(field_value),
-        }
-    raise RuntimeError(f"Unsupported memory_kind for SQLite row conversion: {normalized_memory_kind}")
+    return get_memory_store().build_sqlite_entry_row(entry)
 
 
 # 把 SQLite 读出来的一行转换回当前主数据记录 dict。
-def build_entry_from_sqlite_row(row: sqlite3.Row | dict[str, Any]) -> dict[str, Any]:
-    row_data = dict(row)
-    normalized_memory_kind = str(row_data.get("memory_kind") or "").strip()
-    normalized_title = str(row_data.get("title") or "")
-    normalized_overview_summary = str(row_data.get("overview_summary") or "")
-    normalized_short_summary = str(row_data.get("short_summary") or "")
-    normalized_project_id = str(row_data.get("project_id") or "").strip()
-    common_entry = {
-        "id": str(row_data.get("id") or "").strip(),
-        "memory_kind": normalized_memory_kind,
-        "created_at": str(row_data.get("created_at") or "").strip(),
-        "updated_at": str(row_data.get("updated_at") or "").strip(),
-    }
-    if normalized_memory_kind == "field_record":
-        source_field_name = str(row_data.get("source_field_name") or "").strip()
-        field_value = resolve_field_record_value(row_data, source_field_name)
-        field_entry = {
-            **common_entry,
-            "title": "",
-            "short_summary": "",
-            "overview_summary": "",
-            "detailed_summary": "",
-            "raw_dialogue": "",
-            "problem_background": "",
-            "analysis": "",
-            "action_steps": "",
-            "validation_result": "",
-            "reference_doc_path": field_value if source_field_name == "reference_doc_path" else "",
-            "project_id": "",
-            "source_memory_id": str(row_data.get("source_memory_id") or "").strip(),
-            "source_field_name": source_field_name,
-            "tags": list(field_value) if source_field_name == "tags" and isinstance(field_value, list) else [],
-            "source_paths": [],
-            "retrieval_fields": [source_field_name] if source_field_name else [],
-            "source_field_value_text": str(row_data.get("source_field_value_text") or ""),
-            "source_field_value_json": str(row_data.get("source_field_value_json") or ""),
-        }
-        if source_field_name != CHAT_EVENT_DIALOGUE_FIELD_NAME:
-            field_entry[source_field_name] = field_value
-        return field_entry
-    if normalized_memory_kind == "project_registry" and not normalized_short_summary:
-        normalized_short_summary = build_short_summary(
-            title=normalized_title,
-            detailed_summary=normalized_overview_summary,
-        )
-    normalized_detailed_summary = str(row_data.get("detailed_summary") or "")
-    if normalized_memory_kind == "project_registry" and not normalized_detailed_summary:
-        normalized_detailed_summary = normalized_overview_summary
-    if normalized_memory_kind == "chat_event":
-        normalized_detailed_summary = ""
-    return {
-        **common_entry,
-        "title": normalized_title,
-        "short_summary": normalized_short_summary,
-        "overview_summary": normalized_overview_summary,
-        "detailed_summary": normalized_detailed_summary,
-        "raw_dialogue": load_raw_dialogue(row_data.get("raw_dialogue")) if normalized_memory_kind == "chat_event" else "",
-        "problem_background": str(row_data.get("problem_background") or ""),
-        "analysis": str(row_data.get("analysis") or ""),
-        "action_steps": str(row_data.get("action_steps") or ""),
-        "validation_result": str(row_data.get("validation_result") or ""),
-        "reference_doc_path": str(row_data.get("reference_doc_path") or ""),
-        "project_id": normalized_project_id or (common_entry["id"] if normalized_memory_kind == "project_registry" else ""),
-        "source_memory_id": "",
-        "source_field_name": "",
-        "tags": load_json_string_list(row_data.get("tags_json")),
-        "source_paths": load_json_string_list(row_data.get("source_paths_json")),
-        "retrieval_fields": load_json_string_list(row_data.get("retrieval_fields_json")),
-    }
+def build_entry_from_sqlite_row(row: sqlite3.Row | dict[str, Any], *, include_dialogue: bool=True) -> dict[str, Any]:
+    return get_memory_store().build_entry_from_sqlite_row(row, include_dialogue=include_dialogue)
 
 
 # 读取并校验当前数据库的 user_version；运行时默认只接管空库或当前分表版本，迁移脚本可额外放行旧版本。
-def ensure_supported_sqlite_schema_version(
-    connection: sqlite3.Connection,
-    allowed_versions: set[int] | list[int] | tuple[int, ...] | None = None,
-) -> int:
-    resolved_allowed_versions = (
-        {0, SQLITE_SCHEMA_VERSION}
-        if allowed_versions is None
-        else {int(version) for version in allowed_versions}
-    )
-    current_schema_version = int(connection.execute("PRAGMA user_version").fetchone()[0] or 0)
-    if current_schema_version not in resolved_allowed_versions:
-        expected_versions = ", ".join(str(version) for version in sorted(resolved_allowed_versions))
-        raise RuntimeError(
-            f"Unsupported SQLite schema version {current_schema_version}; expected one of: {expected_versions}."
-        )
-    return current_schema_version
+def ensure_supported_sqlite_schema_version(connection: sqlite3.Connection, allowed_versions: set[int] | list[int] | tuple[int, ...] | None=None) -> int:
+    return get_memory_store().ensure_supported_sqlite_schema_version(unwrap_connection(connection), allowed_versions)
 
 
 # 在当前 SQLite 连接里创建分表结构、只读视图和索引；运行时初始化和一次性迁移脚本都会复用这一步。
 def create_split_sqlite_schema_objects(connection: sqlite3.Connection) -> None:
-    connection.execute(
-        """
-        CREATE TABLE IF NOT EXISTS memory_registry (
-            id TEXT PRIMARY KEY,
-            memory_kind TEXT NOT NULL,
-            created_at TEXT NOT NULL,
-            updated_at TEXT NOT NULL
-        )
-        """
-    )
-    connection.execute(
-        """
-        CREATE TABLE IF NOT EXISTS project_records (
-            id TEXT PRIMARY KEY,
-            title TEXT NOT NULL,
-            short_summary TEXT NOT NULL,
-            detailed_summary TEXT NOT NULL,
-            problem_background TEXT NOT NULL,
-            analysis TEXT NOT NULL,
-            action_steps TEXT NOT NULL,
-            validation_result TEXT NOT NULL,
-            reference_doc_path TEXT NOT NULL,
-            project_id TEXT,
-            tags_json TEXT NOT NULL,
-            source_paths_json TEXT NOT NULL,
-            retrieval_fields_json TEXT NOT NULL
-        )
-        """
-    )
-    connection.execute(
-        """
-        CREATE TABLE IF NOT EXISTS project_registry (
-            id TEXT PRIMARY KEY,
-            title TEXT NOT NULL,
-            overview_summary TEXT NOT NULL,
-            reference_doc_path TEXT NOT NULL,
-            tags_json TEXT NOT NULL,
-            source_paths_json TEXT NOT NULL,
-            retrieval_fields_json TEXT NOT NULL
-        )
-        """
-    )
-    connection.execute(
-        """
-        CREATE TABLE IF NOT EXISTS chat_events (
-            id TEXT PRIMARY KEY,
-            title TEXT NOT NULL,
-            short_summary TEXT NOT NULL,
-            detailed_summary TEXT NOT NULL,
-            raw_dialogue TEXT NOT NULL DEFAULT '',
-            reference_doc_path TEXT NOT NULL,
-            tags_json TEXT NOT NULL,
-            source_paths_json TEXT NOT NULL,
-            retrieval_fields_json TEXT NOT NULL
-        )
-        """
-    )
-    connection.execute(
-        """
-        CREATE TABLE IF NOT EXISTS facts (
-            id TEXT PRIMARY KEY,
-            title TEXT NOT NULL,
-            short_summary TEXT NOT NULL,
-            detailed_summary TEXT NOT NULL,
-            reference_doc_path TEXT NOT NULL,
-            tags_json TEXT NOT NULL,
-            source_paths_json TEXT NOT NULL,
-            retrieval_fields_json TEXT NOT NULL
-        )
-        """
-    )
-    connection.execute(
-        """
-        CREATE TABLE IF NOT EXISTS field_records (
-            id TEXT PRIMARY KEY,
-            source_memory_id TEXT NOT NULL,
-            source_field_name TEXT NOT NULL,
-            source_field_value_text TEXT NOT NULL,
-            source_field_value_json TEXT NOT NULL,
-            created_at TEXT NOT NULL,
-            updated_at TEXT NOT NULL
-        )
-        """
-    )
-    connection.execute("CREATE INDEX IF NOT EXISTS idx_memory_registry_memory_kind ON memory_registry(memory_kind)")
-    connection.execute("CREATE INDEX IF NOT EXISTS idx_memory_registry_updated_at ON memory_registry(updated_at)")
-    connection.execute("CREATE INDEX IF NOT EXISTS idx_project_records_project_id ON project_records(project_id)")
-    connection.execute("CREATE INDEX IF NOT EXISTS idx_project_registry_title ON project_registry(title)")
-    connection.execute("CREATE INDEX IF NOT EXISTS idx_field_records_source_memory_id ON field_records(source_memory_id)")
-    connection.execute("CREATE INDEX IF NOT EXISTS idx_field_records_source_field_name ON field_records(source_field_name)")
-    connection.execute(
-        "CREATE INDEX IF NOT EXISTS idx_field_records_memory_and_field ON field_records(source_memory_id, source_field_name)"
-    )
-    connection.execute(f"DROP VIEW IF EXISTS {PUBLIC_MEMORY_VIEW}")
-    connection.execute(
-        f"""
-        CREATE VIEW {PUBLIC_MEMORY_VIEW} AS
-        SELECT
-            registry.id AS id,
-            registry.memory_kind AS memory_kind,
-            detail.title AS title,
-            detail.short_summary AS short_summary,
-            detail.overview_summary AS overview_summary,
-            detail.detailed_summary AS detailed_summary,
-            detail.raw_dialogue AS raw_dialogue,
-            detail.problem_background AS problem_background,
-            detail.analysis AS analysis,
-            detail.action_steps AS action_steps,
-            detail.validation_result AS validation_result,
-            detail.reference_doc_path AS reference_doc_path,
-            detail.project_id AS project_id,
-            registry.created_at AS created_at,
-            registry.updated_at AS updated_at,
-            '' AS source_memory_id,
-            '' AS source_field_name,
-            detail.tags_json AS tags_json,
-            detail.source_paths_json AS source_paths_json,
-            detail.retrieval_fields_json AS retrieval_fields_json,
-            '' AS source_field_value_text,
-            '' AS source_field_value_json
-        FROM memory_registry AS registry
-        JOIN (
-            SELECT
-                id,
-                title,
-                short_summary,
-                '' AS overview_summary,
-                detailed_summary,
-                '' AS raw_dialogue,
-                problem_background,
-                analysis,
-                action_steps,
-                validation_result,
-                reference_doc_path,
-                project_id,
-                tags_json,
-                source_paths_json,
-                retrieval_fields_json,
-                'project_record' AS memory_kind
-            FROM project_records
-            UNION ALL
-            SELECT
-                id,
-                title,
-                short_summary,
-                '' AS overview_summary,
-                '' AS detailed_summary,
-                raw_dialogue,
-                '' AS problem_background,
-                '' AS analysis,
-                '' AS action_steps,
-                '' AS validation_result,
-                reference_doc_path,
-                '' AS project_id,
-                tags_json,
-                source_paths_json,
-                retrieval_fields_json,
-                'chat_event' AS memory_kind
-            FROM chat_events
-            UNION ALL
-            SELECT
-                id,
-                title,
-                short_summary,
-                '' AS overview_summary,
-                detailed_summary,
-                '' AS raw_dialogue,
-                '' AS problem_background,
-                '' AS analysis,
-                '' AS action_steps,
-                '' AS validation_result,
-                reference_doc_path,
-                '' AS project_id,
-                tags_json,
-                source_paths_json,
-                retrieval_fields_json,
-                'fact' AS memory_kind
-            FROM facts
-            UNION ALL
-            SELECT
-                id,
-                title,
-                '' AS short_summary,
-                overview_summary,
-                '' AS detailed_summary,
-                '' AS raw_dialogue,
-                '' AS problem_background,
-                '' AS analysis,
-                '' AS action_steps,
-                '' AS validation_result,
-                reference_doc_path,
-                id AS project_id,
-                tags_json,
-                source_paths_json,
-                retrieval_fields_json,
-                'project_registry' AS memory_kind
-            FROM project_registry
-        ) AS detail
-        ON registry.id = detail.id AND registry.memory_kind = detail.memory_kind
-        """
-    )
-    connection.execute(f"DROP VIEW IF EXISTS {ALL_MEMORY_VIEW}")
-    connection.execute(
-        f"""
-        CREATE VIEW {ALL_MEMORY_VIEW} AS
-        SELECT
-            id,
-            memory_kind,
-            title,
-            short_summary,
-            overview_summary,
-            detailed_summary,
-            raw_dialogue,
-            problem_background,
-            analysis,
-            action_steps,
-            validation_result,
-            reference_doc_path,
-            project_id,
-            created_at,
-            updated_at,
-            source_memory_id,
-            source_field_name,
-            tags_json,
-            source_paths_json,
-            retrieval_fields_json,
-            source_field_value_text,
-            source_field_value_json
-        FROM {PUBLIC_MEMORY_VIEW}
-        UNION ALL
-        SELECT
-            field_records.id AS id,
-            'field_record' AS memory_kind,
-            '' AS title,
-            '' AS short_summary,
-            '' AS overview_summary,
-            '' AS detailed_summary,
-            '' AS raw_dialogue,
-            '' AS problem_background,
-            '' AS analysis,
-            '' AS action_steps,
-            '' AS validation_result,
-            '' AS reference_doc_path,
-            '' AS project_id,
-            field_records.created_at AS created_at,
-            field_records.updated_at AS updated_at,
-            field_records.source_memory_id AS source_memory_id,
-            field_records.source_field_name AS source_field_name,
-            '[]' AS tags_json,
-            '[]' AS source_paths_json,
-            json_array(field_records.source_field_name) AS retrieval_fields_json,
-            field_records.source_field_value_text AS source_field_value_text,
-            field_records.source_field_value_json AS source_field_value_json
-        FROM field_records
-        """
-    )
+    return get_memory_store().create_split_sqlite_schema_objects(unwrap_connection(connection))
 
 
 # 把现有 schema v2 就地升级到 v3；这里只补 project_registry 物理表和 project_records.project_id，不动旧 project_record 内容。
 def migrate_sqlite_schema_v2_to_v3(connection: sqlite3.Connection) -> None:
-    existing_project_record_columns = {
-        str(row["name"] or "").strip()
-        for row in connection.execute("PRAGMA table_info(project_records)").fetchall()
-    }
-    if "project_id" not in existing_project_record_columns:
-        connection.execute("ALTER TABLE project_records ADD COLUMN project_id TEXT")
+    return get_memory_store().migrate_sqlite_schema_v2_to_v3(unwrap_connection(connection))
 
 
 # 把 schema v3 的 chat_event 正文复制到 raw_dialogue；旧列保留为物理兼容占位，不再进入当前业务视图。
 def migrate_sqlite_schema_v3_to_v4(connection: sqlite3.Connection) -> None:
-    existing_chat_event_columns = {
-        str(row["name"] or "").strip()
-        for row in connection.execute("PRAGMA table_info(chat_events)").fetchall()
-    }
-    if not existing_chat_event_columns:
-        return
-    if "raw_dialogue" not in existing_chat_event_columns:
-        connection.execute("ALTER TABLE chat_events ADD COLUMN raw_dialogue TEXT NOT NULL DEFAULT ''")
-    if "detailed_summary" in existing_chat_event_columns:
-        connection.execute(
-            """
-            UPDATE chat_events
-            SET raw_dialogue = detailed_summary
-            WHERE raw_dialogue = ''
-            """
-        )
+    return get_memory_store().migrate_sqlite_schema_v3_to_v4(unwrap_connection(connection))
 
 
 # 在 SQLite 中初始化当前分表 schema；这里只接管空库或已经切到分表版本的数据库文件。
 def initialize_sqlite_schema(connection: sqlite3.Connection) -> None:
-    current_schema_version = ensure_supported_sqlite_schema_version(
-        connection,
-        allowed_versions={0, 2, 3, SQLITE_SCHEMA_VERSION},
-    )
-    if current_schema_version == 2:
-        migrate_sqlite_schema_v2_to_v3(connection)
-    if current_schema_version in {2, 3}:
-        migrate_sqlite_schema_v3_to_v4(connection)
-    create_split_sqlite_schema_objects(connection)
-    if current_schema_version != SQLITE_SCHEMA_VERSION:
-        connection.execute(f"PRAGMA user_version = {SQLITE_SCHEMA_VERSION}")
+    return get_memory_store().initialize_sqlite_schema(unwrap_connection(connection))
 
 
 # 把主记忆写入轻总表；save/update 的公共父记录索引字段统一通过这里落盘。
 def upsert_memory_registry(entries: list[dict[str, Any]], connection: sqlite3.Connection) -> None:
-    if not entries:
-        return
-    connection.executemany(
-        """
-        INSERT OR REPLACE INTO memory_registry ( id, memory_kind, created_at, updated_at
-        ) VALUES (
-            :id, :memory_kind, :created_at, :updated_at
-        )
-        """,
-        [
-            {
-                "id": str(entry.get("id") or "").strip(),
-                "memory_kind": str(entry.get("memory_kind") or "").strip(),
-                "created_at": str(entry.get("created_at") or "").strip(),
-                "updated_at": str(entry.get("updated_at") or "").strip(),
-            }
-            for entry in entries
-        ],
-    )
+    return get_memory_store().upsert_memory_registry(entries, unwrap_connection(connection))
 
 
 # 按类型把公共主记忆写到各自详情表；这层只负责物理落盘，不负责类型判断之外的业务规则。
 def upsert_public_memory_details(entries: list[dict[str, Any]], connection: sqlite3.Connection) -> None:
-    if not entries:
-        return
-    grouped_entries: dict[str, list[dict[str, Any]]] = {
-        "project_record": [],
-        "chat_event": [],
-        "fact": [],
-        "project_registry": [],
-    }
-    for entry in entries:
-        memory_kind = str(entry.get("memory_kind") or "").strip()
-        if memory_kind not in grouped_entries:
-            raise RuntimeError(f"Unsupported public memory_kind for detail upsert: {memory_kind}")
-        grouped_entries[memory_kind].append(build_sqlite_entry_row(entry))
-
-    if grouped_entries["project_record"]:
-        connection.executemany(
-            """
-            INSERT OR REPLACE INTO project_records (
-                id, title, short_summary, detailed_summary, problem_background,
-                analysis, action_steps, validation_result, reference_doc_path, project_id,
-                tags_json, source_paths_json, retrieval_fields_json
-            ) VALUES (
-                :id, :title, :short_summary, :detailed_summary, :problem_background,
-                :analysis, :action_steps, :validation_result, :reference_doc_path, :project_id,
-                :tags_json, :source_paths_json, :retrieval_fields_json
-            )
-            """,
-            grouped_entries["project_record"],
-        )
-    if grouped_entries["chat_event"]:
-        connection.executemany(
-            """
-            INSERT OR REPLACE INTO chat_events (
-                id, title, short_summary, detailed_summary, raw_dialogue, reference_doc_path,
-                tags_json, source_paths_json, retrieval_fields_json
-            ) VALUES (
-                :id, :title, :short_summary, :detailed_summary, :raw_dialogue, :reference_doc_path,
-                :tags_json, :source_paths_json, :retrieval_fields_json
-            )
-            """,
-            grouped_entries["chat_event"],
-        )
-    if grouped_entries["fact"]:
-        connection.executemany(
-            """
-            INSERT OR REPLACE INTO facts (
-                id, title, short_summary, detailed_summary, reference_doc_path,
-                tags_json, source_paths_json, retrieval_fields_json
-            ) VALUES (
-                :id, :title, :short_summary, :detailed_summary, :reference_doc_path,
-                :tags_json, :source_paths_json, :retrieval_fields_json
-            )
-            """,
-            grouped_entries["fact"],
-        )
-    if grouped_entries["project_registry"]:
-        connection.executemany(
-            """
-            INSERT OR REPLACE INTO project_registry (
-                id, title, overview_summary, reference_doc_path,
-                tags_json, source_paths_json, retrieval_fields_json
-            ) VALUES (
-                :id, :title, :overview_summary, :reference_doc_path,
-                :tags_json, :source_paths_json, :retrieval_fields_json
-            )
-            """,
-            grouped_entries["project_registry"],
-        )
+    return get_memory_store().upsert_public_memory_details(entries, unwrap_connection(connection))
 
 
 # 把 field_record 写进最小必要字段表；这里不再把一堆公共业务空列物理落盘。
 def upsert_field_record_rows(entries: list[dict[str, Any]], connection: sqlite3.Connection) -> None:
-    if not entries:
-        return
-    connection.executemany(
-        """
-        INSERT OR REPLACE INTO field_records (
-            id, source_memory_id, source_field_name, source_field_value_text, source_field_value_json, created_at, updated_at
-        ) VALUES (
-            :id, :source_memory_id, :source_field_name, :source_field_value_text,
-            :source_field_value_json, :created_at, :updated_at
-        )
-        """,
-        [build_sqlite_entry_row(entry) for entry in entries],
-    )
+    return get_memory_store().upsert_field_record_rows(entries, unwrap_connection(connection))
 
 
 # 从公共主记忆只读视图按 id 取一批记录；返回形状继续对齐旧的统一 entry dict。
-def fetch_public_memory_entries_by_ids(record_ids: list[str], connection: sqlite3.Connection | None = None) -> list[dict[str, Any]]:
-    normalized_ids = normalize_record_ids(record_ids)
-    if not normalized_ids:
-        return []
-    placeholders = ",".join("?" for _ in normalized_ids)
-    owned_connection = connection is None
-    if owned_connection:
-        ensure_sqlite_store_ready()
-    db = connection or get_sqlite_connection()
-    try:
-        rows = db.execute(
-            f"SELECT {', '.join(SQLITE_ENTRY_COLUMNS)}, source_field_value_text, source_field_value_json FROM {PUBLIC_MEMORY_VIEW} WHERE id IN ({placeholders})",
-            normalized_ids,
-        ).fetchall()
-    finally:
-        if owned_connection:
-            db.close()
-    entry_map = {
-        str(entry.get("id") or "").strip(): entry
-        for entry in (build_entry_from_sqlite_row(row) for row in rows)
-    }
-    return [entry_map[record_id] for record_id in normalized_ids if record_id in entry_map]
+def fetch_public_memory_entries_by_ids(record_ids: list[str], connection: sqlite3.Connection | None=None) -> list[dict[str, Any]]:
+    return get_memory_store().fetch_public_memory_entries_by_ids(record_ids, unwrap_connection(connection))
 
 
 # 从公开记录 id 的稳定前缀判断物理类型；旧的无类型前缀由详情读取函数回查 memory_registry。
 def resolve_memory_kind_from_record_id(record_id: str) -> str | None:
-    normalized_record_id = str(record_id or "").strip()
-    for id_prefix, memory_kind in DETAIL_MEMORY_KIND_BY_ID_PREFIX:
-        if normalized_record_id.startswith(id_prefix):
-            return memory_kind
-    return None
+    return get_memory_store().resolve_memory_kind_from_record_id(record_id)
 
 
 def build_detail_record_from_sqlite_row(row: sqlite3.Row | dict[str, Any]) -> dict[str, Any]:
-    row_data = dict(row)
-    record = {
-        "id": str(row_data.pop("id", "") or "").strip(),
-        "memory_kind": str(row_data.pop("memory_kind", "") or "").strip(),
-        "created_at": str(row_data.pop("created_at", "") or "").strip(),
-        "updated_at": str(row_data.pop("updated_at", "") or "").strip(),
-    }
-    for field_name, value in row_data.items():
-        if field_name == "tags_json":
-            record["tags"] = load_json_string_list(value)
-        elif field_name == "source_paths_json":
-            record["source_paths"] = load_json_string_list(value)
-        elif field_name == "raw_dialogue" and record["memory_kind"] == "chat_event":
-            record["raw_dialogue"] = load_raw_dialogue(value)
-        else:
-            record[field_name] = str(value or "")
-    if record["memory_kind"] == "project_registry":
-        record["project_id"] = record["id"]
-    return record
+    return get_memory_store().build_detail_record_from_sqlite_row(row)
 
 
 # get_details_by_ids 专用回源：按 id 类型分组直查物理表，不经过公共大宽表或全局字段白名单。
 def fetch_detail_records_by_ids(record_ids: list[str]) -> list[dict[str, Any]]:
-    ensure_sqlite_store_ready()
-    normalized_ids = normalize_record_ids(record_ids)
-    if not normalized_ids:
-        return []
-    field_record_ids = [record_id for record_id in normalized_ids if record_id.startswith("fmem-")]
-    if field_record_ids:
-        raise ValueError(
-            f"field_record is an internal index asset and cannot be read directly: {field_record_ids[0]}"
-        )
-
-    memory_kind_by_id = {
-        record_id: resolve_memory_kind_from_record_id(record_id)
-        for record_id in normalized_ids
-    }
-    unresolved_ids = [record_id for record_id, memory_kind in memory_kind_by_id.items() if memory_kind is None]
-
-    with closing(get_sqlite_connection()) as connection:
-        if unresolved_ids:
-            placeholders = ",".join("?" for _ in unresolved_ids)
-            rows = connection.execute(
-                f"SELECT id, memory_kind FROM memory_registry WHERE id IN ({placeholders})",
-                unresolved_ids,
-            ).fetchall()
-            for row in rows:
-                record_id = str(row["id"] or "").strip()
-                memory_kind = str(row["memory_kind"] or "").strip()
-                if memory_kind in DETAIL_TABLE_BY_MEMORY_KIND:
-                    memory_kind_by_id[record_id] = memory_kind
-
-        ids_by_memory_kind = {memory_kind: [] for memory_kind in DETAIL_TABLE_BY_MEMORY_KIND}
-        for record_id in normalized_ids:
-            memory_kind = memory_kind_by_id.get(record_id)
-            if memory_kind in ids_by_memory_kind:
-                ids_by_memory_kind[memory_kind].append(record_id)
-
-        detail_record_map: dict[str, dict[str, Any]] = {}
-        for memory_kind, ids_for_kind in ids_by_memory_kind.items():
-            if not ids_for_kind:
-                continue
-            table_name = DETAIL_TABLE_BY_MEMORY_KIND[memory_kind]
-            detail_columns = DETAIL_COLUMNS_BY_MEMORY_KIND[memory_kind]
-            selected_detail_columns = ", ".join(f"detail.{column_name}" for column_name in detail_columns)
-            placeholders = ",".join("?" for _ in ids_for_kind)
-            rows = connection.execute(
-                f"""
-                SELECT
-                    registry.id AS id,
-                    registry.memory_kind AS memory_kind,
-                    registry.created_at AS created_at,
-                    registry.updated_at AS updated_at,
-                    {selected_detail_columns}
-                FROM memory_registry AS registry
-                INNER JOIN {table_name} AS detail ON detail.id = registry.id
-                WHERE registry.memory_kind = ? AND registry.id IN ({placeholders})
-                """,
-                [memory_kind, *ids_for_kind],
-            ).fetchall()
-            for row in rows:
-                detail_record = build_detail_record_from_sqlite_row(row)
-                detail_record_map[detail_record["id"]] = detail_record
-
-    return [detail_record_map[record_id] for record_id in normalized_ids if record_id in detail_record_map]
+    return get_memory_store().fetch_detail_records_by_ids(record_ids)
 
 
 # 从 field_record 物理表按 id 取一批内部子记录；search 的子记录命中回源会用到这里。
-def fetch_field_record_entries_by_ids(record_ids: list[str], connection: sqlite3.Connection | None = None) -> list[dict[str, Any]]:
-    normalized_ids = normalize_record_ids(record_ids)
-    if not normalized_ids:
-        return []
-    placeholders = ",".join("?" for _ in normalized_ids)
-    owned_connection = connection is None
-    if owned_connection:
-        ensure_sqlite_store_ready()
-    db = connection or get_sqlite_connection()
-    try:
-        rows = db.execute(
-            f"""
-            SELECT
-                id,
-                'field_record' AS memory_kind,
-                '' AS title,
-                '' AS short_summary,
-                '' AS overview_summary,
-                '' AS detailed_summary,
-                '' AS raw_dialogue,
-                '' AS problem_background,
-                '' AS analysis,
-                '' AS action_steps,
-                '' AS validation_result,
-                '' AS reference_doc_path,
-                '' AS project_id,
-                created_at,
-                updated_at,
-                source_memory_id,
-                source_field_name,
-                '[]' AS tags_json,
-                '[]' AS source_paths_json,
-                json_array(source_field_name) AS retrieval_fields_json,
-                source_field_value_text,
-                source_field_value_json
-            FROM field_records
-            WHERE id IN ({placeholders})
-            """,
-            normalized_ids,
-        ).fetchall()
-    finally:
-        if owned_connection:
-            db.close()
-    entry_map = {
-        str(entry.get("id") or "").strip(): entry
-        for entry in (build_entry_from_sqlite_row(row) for row in rows)
-    }
-    return [entry_map[record_id] for record_id in normalized_ids if record_id in entry_map]
+def fetch_field_record_entries_by_ids(record_ids: list[str], connection: sqlite3.Connection | None=None) -> list[dict[str, Any]]:
+    return get_memory_store().fetch_field_record_entries_by_ids(record_ids, unwrap_connection(connection))
 
 
 # 把一批记录写进 SQLite；save/update 的主记忆和 field_record 家族都通过这里落盘。
-def upsert_store_entries(entries: list[dict[str, Any]], connection: sqlite3.Connection | None = None) -> None:
-    if not entries:
-        return
-
-    owned_connection = connection is None
-    if owned_connection:
-        ensure_sqlite_store_ready()
-    db = connection or get_sqlite_connection()
-    try:
-        public_entries = [entry for entry in entries if not is_field_record_entry(entry)]
-        field_entries = [entry for entry in entries if is_field_record_entry(entry)]
-        if public_entries:
-            upsert_memory_registry(public_entries, connection=db)
-            upsert_public_memory_details(public_entries, connection=db)
-        if field_entries:
-            upsert_field_record_rows(field_entries, connection=db)
-        if owned_connection:
-            db.commit()
-    finally:
-        if owned_connection:
-            db.close()
+def upsert_store_entries(entries: list[dict[str, Any]], connection: sqlite3.Connection | None=None) -> None:
+    return get_memory_store().upsert_store_entries(entries, unwrap_connection(connection))
 
 
 # 按主记忆 id 删除记录；delete_by_ids 的主记忆删除和测试清理都通过这里执行。
-def delete_store_entries_by_ids(record_ids: list[str], connection: sqlite3.Connection | None = None) -> None:
-    normalized_ids = normalize_record_ids(record_ids)
-    if not normalized_ids:
-        return
-    placeholders = ",".join("?" for _ in normalized_ids)
-    owned_connection = connection is None
-    if owned_connection:
-        ensure_sqlite_store_ready()
-    db = connection or get_sqlite_connection()
-    try:
-        registry_rows = db.execute(
-            f"SELECT id, memory_kind FROM memory_registry WHERE id IN ({placeholders})",
-            normalized_ids,
-        ).fetchall()
-        ids_by_kind: dict[str, list[str]] = {"project_record": [], "chat_event": [], "fact": [], "project_registry": []}
-        for row in registry_rows:
-            memory_kind = str(row["memory_kind"] or "").strip()
-            if memory_kind in ids_by_kind:
-                ids_by_kind[memory_kind].append(str(row["id"] or "").strip())
-        for memory_kind, ids_for_kind in ids_by_kind.items():
-            if not ids_for_kind:
-                continue
-            detail_placeholders = ",".join("?" for _ in ids_for_kind)
-            target_table = {
-                "project_record": "project_records",
-                "chat_event": "chat_events",
-                "fact": "facts",
-                "project_registry": "project_registry",
-            }[memory_kind]
-            db.execute(f"DELETE FROM {target_table} WHERE id IN ({detail_placeholders})", ids_for_kind)
-        db.execute(f"DELETE FROM memory_registry WHERE id IN ({placeholders})", normalized_ids)
-        if owned_connection:
-            db.commit()
-    finally:
-        if owned_connection:
-            db.close()
+def delete_store_entries_by_ids(record_ids: list[str], connection: sqlite3.Connection | None=None) -> None:
+    return get_memory_store().delete_store_entries_by_ids(record_ids, unwrap_connection(connection))
 
 
 # 按 source_memory_id 删除一批 field_record；update/delete 维护单个主记忆家族时通过这里清理旧子记录。
-def delete_field_records_by_source_ids(source_ids: list[str], connection: sqlite3.Connection | None = None) -> None:
-    normalized_source_ids = normalize_record_ids(source_ids)
-    placeholders = ",".join("?" for _ in normalized_source_ids)
-    owned_connection = connection is None
-    if owned_connection:
-        ensure_sqlite_store_ready()
-    db = connection or get_sqlite_connection()
-    try:
-        db.execute(
-            f"""
-            DELETE FROM field_records
-            WHERE source_memory_id IN ({placeholders})
-            """,
-            normalized_source_ids,
-        )
-        if owned_connection:
-            db.commit()
-    finally:
-        if owned_connection:
-            db.close()
+def delete_field_records_by_source_ids(source_ids: list[str], connection: sqlite3.Connection | None=None) -> None:
+    return get_memory_store().delete_field_records_by_source_ids(source_ids, unwrap_connection(connection))
 
 
 # 按 source_memory_id + source_field_name 精确删除一批 field_record；update 的字段级同步只清理这次受影响的旧子记录。
-def delete_field_records_by_source_and_fields(
-    source_memory_id: str,
-    field_names: list[str] | tuple[str, ...] | set[str],
-    connection: sqlite3.Connection | None = None,
-) -> None:
-    normalized_source_memory_id = str(source_memory_id or "").strip()
-    normalized_field_name_set = {
-        str(field_name or "").strip()
-        for field_name in field_names
-        if str(field_name or "").strip() in SUPPORTED_FIELD_RECORD_SOURCE_FIELDS
-    }
-    normalized_field_names = [
-        field_name
-        for field_name in SUPPORTED_FIELD_RECORD_SOURCE_FIELDS
-        if field_name in normalized_field_name_set
-    ]
-    if not normalized_source_memory_id or not normalized_field_names:
-        return
-
-    placeholders = ",".join("?" for _ in normalized_field_names)
-    owned_connection = connection is None
-    if owned_connection:
-        ensure_sqlite_store_ready()
-    db = connection or get_sqlite_connection()
-    try:
-        db.execute(
-            f"""
-            DELETE FROM field_records
-            WHERE source_memory_id = ?
-              AND source_field_name IN ({placeholders})
-            """,
-            [normalized_source_memory_id, *normalized_field_names],
-        )
-        if owned_connection:
-            db.commit()
-    finally:
-        if owned_connection:
-            db.close()
+def delete_field_records_by_source_and_fields(source_memory_id: str, field_names: list[str] | tuple[str, ...] | set[str], connection: sqlite3.Connection | None=None) -> None:
+    return get_memory_store().delete_field_records_by_source_and_fields(source_memory_id, field_names, unwrap_connection(connection))
 
 
-def fetch_field_record_ids_by_source_and_fields(
-    source_memory_id: str,
-    field_names: list[str] | tuple[str, ...] | set[str],
-    connection: sqlite3.Connection,
-) -> list[str]:
-    normalized_source_memory_id = str(source_memory_id or "").strip()
-    normalized_field_names = [
-        field_name
-        for field_name in SUPPORTED_FIELD_RECORD_SOURCE_FIELDS
-        if field_name in {str(item or "").strip() for item in field_names}
-    ]
-    if not normalized_source_memory_id or not normalized_field_names:
-        return []
-    placeholders = ",".join("?" for _ in normalized_field_names)
-    rows = connection.execute(
-        f"""
-        SELECT id
-        FROM field_records
-        WHERE source_memory_id = ?
-          AND source_field_name IN ({placeholders})
-        ORDER BY id
-        """,
-        [normalized_source_memory_id, *normalized_field_names],
-    ).fetchall()
-    return [str(row["id"] or "").strip() for row in rows if str(row["id"] or "").strip()]
+def fetch_field_record_ids_by_source_and_fields(source_memory_id: str, field_names: list[str] | tuple[str, ...] | set[str], connection: sqlite3.Connection) -> list[str]:
+    return get_memory_store().fetch_field_record_ids_by_source_and_fields(source_memory_id, field_names, unwrap_connection(connection))
 
 
 # 从 SQLite 中读取一批指定 id 的记录，并保持调用方传入的 id 顺序。
 def fetch_store_entries_by_ids(record_ids: list[str]) -> list[dict[str, Any]]:
-    ensure_sqlite_store_ready()
-    normalized_ids = normalize_record_ids(record_ids)
-    if not normalized_ids:
-        return []
-    public_entries = fetch_public_memory_entries_by_ids(normalized_ids)
-    field_entries = fetch_field_record_entries_by_ids(normalized_ids)
-    entry_map = {str(entry.get("id") or "").strip(): entry for entry in [*public_entries, *field_entries]}
-    return [
-        entry_map[record_id]
-        for record_id in normalized_ids
-        if record_id in entry_map
-    ]
+    return get_memory_store().fetch_store_entries_by_ids(record_ids)
 
 
 # 从 db 里按 id 读取单条主数据记录；save/update 的精确回源和冲突检查都通过这里取旧记录。
+def fetch_search_entries_by_ids(record_ids: list[str]) -> list[dict[str, Any]]:
+    """Read search metadata and field slices without loading complete dialogues."""
+    return get_memory_store().fetch_search_entries_by_ids(record_ids)
+
+
+def fetch_search_parents_by_ids(record_ids: list[str]) -> list[dict[str, Any]]:
+    return get_memory_store().fetch_search_parents_by_ids(record_ids)
+
+
+def iter_index_entries_in_batches(batch_size: int = SQLITE_REBUILD_BATCH_SIZE) -> Any:
+    return get_memory_store().iter_index_entries_in_batches(batch_size)
+
+
 def fetch_store_entry_by_id(record_id: str) -> dict[str, Any] | None:
-    ensure_sqlite_store_ready()
-    normalized_record_id = str(record_id or "").strip()
-    if not normalized_record_id:
-        return None
-    fetched_entries = fetch_store_entries_by_ids([normalized_record_id])
-    return fetched_entries[0] if fetched_entries else None
+    return get_memory_store().fetch_store_entry_by_id(record_id)
 
 
 # 按项目标题读取 project_registry；create_project 用它挡住重复项目名。
 def fetch_project_registry_entry_by_title(title: str) -> dict[str, Any] | None:
-    ensure_sqlite_store_ready()
-    normalized_title = collapse_text(title)
-    if not normalized_title:
-        return None
-    with closing(get_sqlite_connection()) as connection:
-        row = connection.execute(
-            f"""
-            SELECT {', '.join(SQLITE_ENTRY_COLUMNS)}, source_field_value_text, source_field_value_json
-            FROM {PUBLIC_MEMORY_VIEW}
-            WHERE memory_kind = 'project_registry' AND title = ?
-            ORDER BY {SQLITE_ENTRY_ORDER_BY}
-            LIMIT 1
-            """,
-            (normalized_title,),
-        ).fetchone()
-    if row is None:
-        return None
-    return build_entry_from_sqlite_row(row)
+    return get_memory_store().fetch_project_registry_entry_by_title(title)
 
 
 # 判断某个 project_registry 下面是否仍挂着项目问题；delete_by_ids 会先用它挡住误删。
 def project_registry_has_project_records(project_id: str) -> bool:
-    ensure_sqlite_store_ready()
-    normalized_project_id = str(project_id or "").strip()
-    if not normalized_project_id:
-        return False
-    with closing(get_sqlite_connection()) as connection:
-        row = connection.execute(
-            """
-            SELECT 1 AS exists_value
-            FROM project_records
-            WHERE project_id = ?
-            LIMIT 1
-            """,
-            (normalized_project_id,),
-        ).fetchone()
-    return row is not None
+    return get_memory_store().project_registry_has_project_records(project_id)
 
 
 
@@ -1692,346 +688,69 @@ def project_registry_has_project_records(project_id: str) -> bool:
 
 # 读取一批 source_memory_id 相关的当前家族记录，包含主记忆本体和它当前仍存在的 field_record 子记录。
 def fetch_entry_family_by_source_ids(source_ids: set[str]) -> list[dict[str, Any]]:
-    ensure_sqlite_store_ready()
-    normalized_source_ids = [
-        str(source_id or "").strip()
-        for source_id in sorted(source_ids)
-        if str(source_id or "").strip()
-    ]
-    if not normalized_source_ids:
-        return []
-    placeholders = ",".join("?" for _ in normalized_source_ids)
-    public_entries = fetch_public_memory_entries_by_ids(normalized_source_ids)
-    with closing(get_sqlite_connection()) as connection:
-        field_rows = connection.execute(
-            f"""
-            SELECT
-                id,
-                'field_record' AS memory_kind,
-                '' AS title,
-                '' AS short_summary,
-                '' AS overview_summary,
-                '' AS detailed_summary,
-                '' AS raw_dialogue,
-                '' AS problem_background,
-                '' AS analysis,
-                '' AS action_steps,
-                '' AS validation_result,
-                '' AS reference_doc_path,
-                '' AS project_id,
-                created_at,
-                updated_at,
-                source_memory_id,
-                source_field_name,
-                '[]' AS tags_json,
-                '[]' AS source_paths_json,
-                json_array(source_field_name) AS retrieval_fields_json,
-                source_field_value_text,
-                source_field_value_json
-            FROM field_records
-            WHERE source_memory_id IN ({placeholders})
-            ORDER BY {SQLITE_ENTRY_ORDER_BY}
-            """,
-            normalized_source_ids,
-        ).fetchall()
-    family_entries = [*public_entries, *(build_entry_from_sqlite_row(row) for row in field_rows)]
-    return sort_entries(family_entries)
+    return get_memory_store().fetch_entry_family_by_source_ids(source_ids)
 
 
 # 读取当前整库里真正进入向量索引的稳定顺序 id 列表；空检索文本记录会在这里被排除。
 def fetch_ordered_store_entry_ids() -> list[str]:
-    ensure_sqlite_store_ready()
-    with closing(get_sqlite_connection()) as connection:
-        rows = connection.execute(
-            f"""
-            SELECT {', '.join(SQLITE_ENTRY_COLUMNS)}, source_field_value_text, source_field_value_json
-            FROM {ALL_MEMORY_VIEW}
-            ORDER BY {SQLITE_ENTRY_ORDER_BY}
-            """
-        ).fetchall()
-    ordered_entries = [build_entry_from_sqlite_row(row) for row in rows]
-    return [entry_id for entry_id, _, _ in build_indexable_entry_payloads(ordered_entries)]
+    return get_memory_store().fetch_ordered_store_entry_ids()
 
 
 # 统计当前公开主记忆条数；对外 total_entries 不把 field_record 算进去。
 def count_public_store_entries() -> int:
-    ensure_sqlite_store_ready()
-    with closing(get_sqlite_connection()) as connection:
-        row = connection.execute(
-            "SELECT COUNT(1) AS count_value FROM memory_registry"
-        ).fetchone()
-    return int(row["count_value"] or 0) if row is not None else 0
+    return get_memory_store().count_public_store_entries()
 
 
 # 读取按当前稳定顺序排列的前若干条公开主记忆；save/update 的 timeline_summary 直接用这里，不再整库裁切。
-def fetch_public_timeline_summary_entries(limit: int = 3) -> list[dict[str, Any]]:
-    ensure_sqlite_store_ready()
-    with closing(get_sqlite_connection()) as connection:
-        rows = connection.execute(
-            f"""
-            SELECT {', '.join(SQLITE_ENTRY_COLUMNS)}, source_field_value_text, source_field_value_json
-            FROM {PUBLIC_MEMORY_VIEW}
-            ORDER BY {SQLITE_ENTRY_ORDER_BY}
-            LIMIT ?
-            """,
-            (max(0, int(limit or 0)),),
-        ).fetchall()
-    return [build_entry_from_sqlite_row(row) for row in rows]
+def fetch_public_timeline_summary_entries(limit: int=3) -> list[dict[str, Any]]:
+    return get_memory_store().fetch_public_timeline_summary_entries(limit)
 
 
 # 逐批读取当前整库记录；后台全量 embedding 用这里分批拿 SQLite 数据，避免一次性堆完整检索文本。
-def iter_store_entries_in_batches(batch_size: int = SQLITE_REBUILD_BATCH_SIZE) -> Any:
-    ensure_sqlite_store_ready()
-    offset = 0
-    resolved_batch_size = max(1, int(batch_size or SQLITE_REBUILD_BATCH_SIZE))
-    while True:
-        with closing(get_sqlite_connection()) as connection:
-            rows = connection.execute(
-                f"""
-                SELECT {', '.join(SQLITE_ENTRY_COLUMNS)}, source_field_value_text, source_field_value_json
-                FROM {ALL_MEMORY_VIEW}
-                ORDER BY {SQLITE_ENTRY_ORDER_BY}
-                LIMIT ? OFFSET ?
-                """,
-                (resolved_batch_size, offset),
-            ).fetchall()
-        if not rows:
-            return
-        yield [build_entry_from_sqlite_row(row) for row in rows]
-        offset += resolved_batch_size
+def iter_store_entries_in_batches(batch_size: int=SQLITE_REBUILD_BATCH_SIZE) -> Any:
+    return get_memory_store().iter_store_entries_in_batches(batch_size)
 
 
 # 逐批读取当前公开主记忆，用来生成时间线 Markdown，避免每次写入都先整库 load_store() 再裁切。
-def iter_public_entries_for_timeline(batch_size: int = SQLITE_REBUILD_BATCH_SIZE) -> Any:
-    ensure_sqlite_store_ready()
-    offset = 0
-    resolved_batch_size = max(1, int(batch_size or SQLITE_REBUILD_BATCH_SIZE))
-    while True:
-        with closing(get_sqlite_connection()) as connection:
-            rows = connection.execute(
-                f"""
-                SELECT {', '.join(SQLITE_ENTRY_COLUMNS)}, source_field_value_text, source_field_value_json
-                FROM {PUBLIC_MEMORY_VIEW}
-                ORDER BY {SQLITE_ENTRY_ORDER_BY}
-                LIMIT ? OFFSET ?
-                """,
-                (resolved_batch_size, offset),
-            ).fetchall()
-        if not rows:
-            return
-        yield [build_entry_from_sqlite_row(row) for row in rows]
-        offset += resolved_batch_size
+def iter_public_entries_for_timeline(batch_size: int=SQLITE_REBUILD_BATCH_SIZE) -> Any:
+    return get_memory_store().iter_public_entries_for_timeline(batch_size)
 
 
 # 确保 SQLite 主数据层已准备好；这里只接管已经切到分表结构的库或全新空库。
 def ensure_sqlite_store_ready() -> None:
-    with _SQLITE_INIT_LOCK:
-        with closing(get_sqlite_connection()) as connection:
-            initialize_sqlite_schema(connection)
-            connection.commit()
+    return get_memory_store().ensure_sqlite_store_ready()
 
 
 # 把自由文本压缩成单行紧凑字符串，避免空白符干扰存储和字段比较。
 # 比如 "A\nB" -> "A B"
 def collapse_text(value: str | None) -> str:
-    return " ".join(str(value or "").split()).strip()
+    return memory_domain.collapse_text(value)
 
 
 # 规范化长文本块，保留段落换行，但去掉多余空白和首尾空行。
 def normalize_text_block(value: str | None) -> str:
-    raw_text = str(value or "").replace("\r\n", "\n").replace("\r", "\n")
-    lines = [line.strip() for line in raw_text.split("\n")]
-    non_empty_lines = [line for line in lines if line]
-    return "\n".join(non_empty_lines).strip()
+    return memory_domain.normalize_text_block(value)
 
 
 def normalize_json_metadata(value: dict[str, Any], field_path: str) -> dict[str, Any]:
-    try:
-        return json.loads(json.dumps(value, ensure_ascii=False, allow_nan=False))
-    except (TypeError, ValueError, RecursionError) as exc:
-        raise ValueError(f"{field_path} must contain only JSON-serializable values") from exc
+    return memory_domain.normalize_json_metadata(value, field_path)
 
 
-def select_matched_message_ids(message_scores: dict[str, tuple[float, int]]) -> list[str]:
-    """Rank message anchors independently of the parent record's other fields."""
-    ranked = sorted(
-        ((message_id, score, index) for message_id, (score, index) in message_scores.items() if math.isfinite(score)),
-        key=lambda item: (-item[1], item[2], item[0]),
-    )
-    if not ranked:
-        return []
-    best_score = ranked[0][1]
-    # FAISS scores are float32; tolerate their rounding at the inclusive boundary.
-    return [
-        message_id for message_id, score, _ in ranked
-        if best_score - score <= MESSAGE_SCORE_GAP
-        or (MESSAGE_SCORE_GAP > 0 and math.isclose(best_score - score, MESSAGE_SCORE_GAP, rel_tol=0.0, abs_tol=1e-7))
-    ][:MAX_TOTAL_MESSAGES]
+def resolve_message_top_k(message_top_k: int | None=None) -> int:
+    return memory_domain.resolve_message_top_k(message_top_k, default_message_top_k=MESSAGE_TOP_K)
 
 
-def build_dialogue_context(
-    dialogue: Any, matched_message_ids: list[str] | None = None
-) -> dict[str, Any]:
-    """Build an output-only view; never change the stored dialogue or its messages."""
-    if not isinstance(dialogue, dict) or not isinstance(dialogue.get("messages"), list):
-        raise ValueError("raw_dialogue is not structured; request full_dialogue=true to read it.")
-    messages = dialogue["messages"]
-    positions = {message["message_id"]: index for index, message in enumerate(messages)}
-    requested = list(dict.fromkeys(matched_message_ids or []))
-    unresolved = [message_id for message_id in requested if message_id not in positions]
-    valid = [message_id for message_id in requested if message_id in positions]
-    anchors = valid[:MAX_TOTAL_MESSAGES]
-    selected = {positions[message_id] for message_id in anchors}
-    if anchors:
-        mode = "matched_context"
-        reason = "matched_messages"
-        for distance in range(1, min(RETURN_MESSAGE_NUM, len(messages)) + 1):
-            if len(selected) >= MAX_TOTAL_MESSAGES:
-                break
-            for message_id in anchors:
-                center = positions[message_id]
-                for index in (center - distance, center + distance):
-                    if len(selected) < MAX_TOTAL_MESSAGES and 0 <= index < len(messages):
-                        selected.add(index)
-    else:
-        mode = "tail_preview"
-        reason = "anchors_not_found" if requested else "no_anchors"
-        count = min(2 * RETURN_MESSAGE_NUM + 1, MAX_TOTAL_MESSAGES)
-        selected = set(range(max(0, len(messages) - count), len(messages)))
+def select_matched_messages(message_scores: dict[str, tuple[float, int]], message_top_k: int | None=None) -> list[dict[str, Any]]:
+    return memory_domain.select_matched_messages(message_scores, message_top_k, default_message_top_k=MESSAGE_TOP_K, message_score_gap=MESSAGE_SCORE_GAP, return_message_num=RETURN_MESSAGE_NUM)
 
-    output: list[dict[str, Any]] = []
 
-    def append_omission(count: int) -> None:
-        if count:
-            output.append({
-                "type": "omission",
-                "omitted_count": count,
-                "content": f"[... 省略 {count} 条消息 ...]",
-            })
-
-    previous = -1
-    for index in sorted(selected):
-        append_omission(index - previous - 1)
-        output.append(dict(messages[index]))
-        previous = index
-    append_omission(len(messages) - previous - 1)
-    return {
-        **dialogue,
-        "messages": output,
-        "context": {
-            "mode": mode,
-            "reason": reason,
-            "total_messages": len(messages),
-            "returned_messages": len(selected),
-            "truncated": len(selected) < len(messages),
-            "anchor_message_ids": anchors,
-            "unresolved_message_ids": unresolved,
-            "omitted_anchor_count": len(valid) - len(anchors),
-        },
-    }
+def build_dialogue_context(dialogue: Any, matched_message_ids: list[str] | None=None) -> dict[str, Any]:
+    return memory_domain.build_dialogue_context(dialogue, matched_message_ids, return_message_num=RETURN_MESSAGE_NUM)
 
 
 # 结构化对话是 chat_event 的主数据；legacy 字符串只允许内部兼容读取，不能再从新接口写入。
-def normalize_raw_dialogue(
-    value: Any,
-    *,
-    allow_legacy: bool = False,
-) -> str | dict[str, Any]:
-    if not isinstance(value, dict):
-        legacy_text = str(value or "").replace("\r\n", "\n").replace("\r", "\n").strip()
-        if legacy_text and not allow_legacy:
-            raise ValueError("raw_dialogue must be a structured object with a non-empty messages array")
-        return legacy_text
-
-    if "context" in value:
-        raise ValueError(
-            "raw_dialogue is a read-only context view and cannot be saved or updated; "
-            "request full_dialogue=true before replacing the complete dialogue."
-        )
-    unsupported_top_level_fields = set(value) - {"schema_version", "messages", "metadata"}
-    if unsupported_top_level_fields:
-        unsupported_text = ", ".join(sorted(str(item) for item in unsupported_top_level_fields))
-        raise ValueError(f"raw_dialogue contains unsupported fields: {unsupported_text}")
-
-    raw_schema_version = value.get("schema_version", CHAT_DIALOGUE_SCHEMA_VERSION)
-    if raw_schema_version != CHAT_DIALOGUE_SCHEMA_VERSION:
-        raise ValueError(f"raw_dialogue.schema_version must be {CHAT_DIALOGUE_SCHEMA_VERSION}")
-
-    raw_messages = value.get("messages")
-    if not isinstance(raw_messages, list) or not raw_messages:
-        raise ValueError("raw_dialogue.messages must be a non-empty array")
-
-    raw_top_level_metadata = value.get("metadata")
-    if raw_top_level_metadata is not None and not isinstance(raw_top_level_metadata, dict):
-        raise ValueError("raw_dialogue.metadata must be an object when provided")
-
-    normalized_messages: list[dict[str, Any]] = []
-    seen_message_ids: set[str] = set()
-    for message_index, raw_message in enumerate(raw_messages):
-        if not isinstance(raw_message, dict):
-            raise ValueError(f"raw_dialogue.messages[{message_index}] must be an object")
-        unsupported_message_fields = set(raw_message) - {
-            "message_id",
-            "role",
-            "content",
-            "timestamp",
-            "metadata",
-        }
-        if unsupported_message_fields:
-            unsupported_text = ", ".join(sorted(str(item) for item in unsupported_message_fields))
-            raise ValueError(
-                f"raw_dialogue.messages[{message_index}] contains unsupported fields: {unsupported_text}"
-            )
-
-        role = str(raw_message.get("role") or "").strip().lower()
-        if role not in CHAT_DIALOGUE_ROLES:
-            raise ValueError(
-                f"raw_dialogue.messages[{message_index}].role must be one of: {', '.join(CHAT_DIALOGUE_ROLES)}"
-            )
-        content = str(raw_message.get("content") or "").replace("\r\n", "\n").replace("\r", "\n").strip()
-        if not content:
-            raise ValueError(f"raw_dialogue.messages[{message_index}].content must not be empty")
-        timestamp = str(raw_message.get("timestamp") or "").strip()
-        raw_message_metadata = raw_message.get("metadata")
-        if raw_message_metadata is not None and not isinstance(raw_message_metadata, dict):
-            raise ValueError(f"raw_dialogue.messages[{message_index}].metadata must be an object when provided")
-
-        message_id = str(raw_message.get("message_id") or "").strip()
-        if not message_id:
-            id_seed = json.dumps(
-                [message_index, role, content, timestamp],
-                ensure_ascii=False,
-                separators=(",", ":"),
-            )
-            message_id = f"msg-{hashlib.sha256(id_seed.encode('utf-8')).hexdigest()[:12]}"
-        if message_id in seen_message_ids:
-            raise ValueError(f"raw_dialogue contains duplicate message_id: {message_id}")
-        seen_message_ids.add(message_id)
-
-        normalized_message: dict[str, Any] = {
-            "message_id": message_id,
-            "role": role,
-            "content": content,
-        }
-        if timestamp:
-            normalized_message["timestamp"] = timestamp
-        if raw_message_metadata:
-            normalized_message["metadata"] = normalize_json_metadata(
-                raw_message_metadata,
-                f"raw_dialogue.messages[{message_index}].metadata",
-            )
-        normalized_messages.append(normalized_message)
-
-    normalized_dialogue: dict[str, Any] = {
-        "schema_version": CHAT_DIALOGUE_SCHEMA_VERSION,
-        "messages": normalized_messages,
-    }
-    if raw_top_level_metadata:
-        normalized_dialogue["metadata"] = normalize_json_metadata(
-            raw_top_level_metadata,
-            "raw_dialogue.metadata",
-        )
-    return normalized_dialogue
+def normalize_raw_dialogue(value: Any, *, allow_legacy: bool=False) -> str | dict[str, Any]:
+    return memory_domain.normalize_raw_dialogue(value, allow_legacy=allow_legacy, schema_version=CHAT_DIALOGUE_SCHEMA_VERSION, roles=CHAT_DIALOGUE_ROLES)
 
 
 # 尝试把字符串形式的 JSON 数组解析成字符串列表。
@@ -2100,21 +819,7 @@ def coerce_source_path_list_input(value: Any) -> Any:
 
 # 规范化列表输入，去掉空值、重复值，并保持稳定顺序。
 def normalize_list(values: list[str] | None) -> list[str]:
-    if not values:
-        return []
-
-    cleaned: list[str] = []
-    seen: set[str] = set()
-    for raw in values:
-        item = str(raw or "").strip()
-        if not item:
-            continue
-        if item in seen:
-            continue
-        seen.add(item)
-        cleaned.append(item)
-
-    return cleaned
+    return memory_domain.normalize_list(values)
 
 
 # 解析记录时间戳，兼容旧的 YYYY-MM-DD 日期格式，并统一转成到秒的本地 ISO 字符串。
@@ -2587,31 +1292,8 @@ def build_field_record_entry_for_field(source_entry: dict[str, Any], field_name:
 
 
 # 为当前记录生成简短摘要，优先复用调用方提供的内容，否则从详细总结中提炼首条有效信息。
-def build_short_summary(
-    title: str,
-    detailed_summary: str,
-    short_summary: str | None = None,
-) -> str:
-    resolved_short_summary = collapse_text(short_summary)
-    if resolved_short_summary:
-        if len(resolved_short_summary) <= SHORT_SUMMARY_MAX_LENGTH:
-            return resolved_short_summary
-        return f"{resolved_short_summary[:SHORT_SUMMARY_MAX_LENGTH].rstrip()}..."
-
-    normalized_title = collapse_text(title)
-    normalized_summary = normalize_text_block(detailed_summary)
-    candidate_lines = [collapse_text(line) for line in normalized_summary.split("\n") if collapse_text(line)]
-    skip_prefixes = ("标题：", "title:", "title：")
-    preferred_lines = [
-        line
-        for line in candidate_lines
-        if line and line != normalized_title and not line.lower().startswith(skip_prefixes)
-    ]
-    selected_line = preferred_lines[0] if preferred_lines else (candidate_lines[0] if candidate_lines else normalized_title)
-    selected_line = re.sub(r"^(问题背景|问题|分析|步骤|验证结果|摘要|总结)[：:]\s*", "", selected_line).strip()
-    if len(selected_line) <= SHORT_SUMMARY_MAX_LENGTH:
-        return selected_line
-    return f"{selected_line[:SHORT_SUMMARY_MAX_LENGTH].rstrip()}..."
+def build_short_summary(title: str, detailed_summary: str, short_summary: str | None=None) -> str:
+    return memory_domain.build_short_summary(title, detailed_summary, short_summary, max_length=SHORT_SUMMARY_MAX_LENGTH)
 
 
 # 按当前记忆类型计算真正参与向量拼接的字段名列表。
@@ -3909,16 +2591,9 @@ def regenerate_all_field_records_for_current_policy(
     model_path: str,
     dialogue_tokenizer: Any | None = None,
 ) -> None:
-    ensure_sqlite_store_ready()
-    with closing(get_sqlite_connection()) as connection:
-        rows = connection.execute(
-            f"""
-            SELECT {', '.join(SQLITE_ENTRY_COLUMNS)}, source_field_value_text, source_field_value_json
-            FROM {PUBLIC_MEMORY_VIEW}
-            ORDER BY {SQLITE_ENTRY_ORDER_BY}
-            """
-        ).fetchall()
-        public_entries = [build_entry_from_sqlite_row(row) for row in rows]
+    store = get_memory_store()
+    with store.transaction() as transaction:
+        public_entries = store.fetch_all_public_entries(transaction)
         regenerated_field_entries: list[dict[str, Any]] = []
         for public_entry in public_entries:
             regenerated_field_entries.extend(
@@ -3928,10 +2603,9 @@ def regenerate_all_field_records_for_current_policy(
                     model_path=model_path,
                 )
             )
-        connection.execute("DELETE FROM field_records")
+        store.clear_field_records(transaction)
         if regenerated_field_entries:
-            upsert_field_record_rows(regenerated_field_entries, connection=connection)
-        connection.commit()
+            upsert_field_record_rows(regenerated_field_entries, connection=transaction)
 
 
 # 首次建库和缓存自愈
@@ -3952,7 +2626,7 @@ def rebuild_vector_index(
         ordered_entry_ids: list[str] = []
         embedding_batches: list[np.ndarray] = []
         resolved_embedder = embedder
-        for entry_batch in iter_store_entries_in_batches():
+        for entry_batch in iter_index_entries_in_batches():
             indexable_payloads = build_indexable_entry_payloads(entry_batch)
             if not indexable_payloads:
                 continue
@@ -4061,8 +2735,7 @@ def update_store_and_rebuild(
     updated_field_record_entries_for_vector: list[dict[str, Any]] = []
 
     # 先把本次主数据变化精确落到 SQLite，再同步受影响主记忆家族的 field_record。
-    with closing(get_sqlite_connection()) as connection:
-        initialize_sqlite_schema(connection)
+    with get_memory_store().transaction() as connection:
         if deleted_id_set:
             delete_store_entries_by_ids(list(deleted_id_set), connection=connection)
             delete_field_records_by_source_ids(list(deleted_source_ids_for_field_cleanup), connection=connection)
@@ -4141,7 +2814,6 @@ def update_store_and_rebuild(
             updated_field_record_entries_for_vector = list(refreshed_field_entries)
         if refreshed_field_entries:
             upsert_store_entries(refreshed_field_entries, connection=connection)
-        connection.commit()
 
     current_entry_ids = fetch_ordered_store_entry_ids()
     current_entry_id_set = set(current_entry_ids)

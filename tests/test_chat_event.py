@@ -466,8 +466,8 @@ class ChatEventTests(unittest.TestCase):
             server, "build_embedding_model_fingerprint", return_value="fingerprint"
         ), patch.object(server, "encode_texts", return_value=np.ones((1, 2), dtype="float32")), patch.object(
             server.faiss, "read_index", return_value=FakeIndex()
-        ), patch.object(server, "fetch_store_entries_by_ids", return_value=direct_entries), patch.object(
-            server, "fetch_entry_family_by_source_ids", return_value=[parent_a, parent_b]
+        ), patch.object(server, "fetch_search_entries_by_ids", return_value=direct_entries), patch.object(
+            server, "fetch_search_parents_by_ids", return_value=[parent_a, parent_b]
         ):
             with patch.object(server, "SEARCH_MIN_SIMILARITY", 0.90):
                 results = server.search_records("query", top_k=5, embedder=object(), model_path="model")

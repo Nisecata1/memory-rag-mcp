@@ -9,6 +9,7 @@
 from __future__ import annotations
 
 import json
+import math
 import sys
 from pathlib import Path
 from typing import Annotated, Any, Literal
@@ -20,6 +21,8 @@ from pydantic import BaseModel, ConfigDict, Field
 CURRENT_DIR = Path(__file__).resolve().parent
 if str(CURRENT_DIR) not in sys.path:
     sys.path.insert(0, str(CURRENT_DIR))
+
+from memory_access import read_details, read_search_records
 
 # 导入 server_utils 中的底层函数
 from server_utils import (
@@ -43,9 +46,11 @@ from server_utils import (
     ensure_sqlite_store_ready,
     ensure_write_operations_allowed,
     fetch_detail_records_by_ids,
-    fetch_entry_family_by_source_ids,
+    fetch_public_memory_entries_by_ids,
     fetch_public_timeline_summary_entries,
     fetch_project_registry_entry_by_title,
+    fetch_search_entries_by_ids,
+    fetch_search_parents_by_ids,
     fetch_store_entries_by_ids,
     fetch_store_entry_by_id,
     get_embedder,
@@ -58,7 +63,8 @@ from server_utils import (
     resolve_embed_device,
     resolve_embed_model_path,
     resolve_field_record_value,
-    select_matched_message_ids,
+    resolve_message_top_k,
+    select_matched_messages,
     RETRIEVAL_FIELD_SIGNATURE,
     SEARCH_MIN_SIMILARITY,
     serialized_write,
@@ -77,49 +83,20 @@ server = FastMCP(
     ),
 )
 
-# 按多条记录 id 回源主数据并返回类型化详情；这里直接调用物理表读取链路，不碰 meta 或统一公共视图。
+# 业务读取入口；数据库字段与完整/局部对话的装配由读取服务负责。
 def get_detail_records_by_ids(
     record_ids: list[str],
     matched_message_ids: dict[str, list[str]] | None = None,
     full_dialogue: bool = False,
 ) -> dict[str, Any]:
-    normalized_ids = normalize_record_ids(record_ids)
-    anchors_by_id = matched_message_ids if matched_message_ids is not None else {}
-    if not full_dialogue:
-        if not isinstance(anchors_by_id, dict) or any(
-            record_id not in normalized_ids
-            or not isinstance(message_ids, list)
-            or any(not isinstance(message_id, str) or not message_id.strip() for message_id in message_ids)
-            for record_id, message_ids in anchors_by_id.items()
-        ):
-            raise ValueError("matched_message_ids must map requested record IDs to non-empty message ID strings.")
-    fetched_entries = fetch_detail_records_by_ids(normalized_ids)
-    store_entry_map = {
-        str(entry.get("id") or "").strip(): entry
-        for entry in fetched_entries
-    }
-    records: list[dict[str, Any]] = []
-    missing_ids: list[str] = []
-
-    for normalized_record_id in normalized_ids:
-        source_entry = store_entry_map.get(normalized_record_id)
-        if source_entry is None:
-            missing_ids.append(normalized_record_id)
-            continue
-        if source_entry.get("memory_kind") == "chat_event" and not full_dialogue:
-            source_entry = {
-                **source_entry,
-                "raw_dialogue": build_dialogue_context(
-                    source_entry.get("raw_dialogue"), anchors_by_id.get(normalized_record_id)
-                ),
-            }
-        records.append(source_entry)
-
-    return {
-        "ids": normalized_ids,
-        "records": records,
-        "missing_ids": missing_ids,
-    }
+    return read_details(
+        record_ids,
+        matched_message_ids=matched_message_ids,
+        full_dialogue=full_dialogue,
+        read_records=fetch_detail_records_by_ids,
+        normalize_ids=normalize_record_ids,
+        build_context=build_dialogue_context,
+    )
 
 
 # 按多条记录 id 从主数据中硬删除条目，并在成功删除后更新主数据与向量库；保留在本文件是为了让“接口 -> 主数据变更 -> 触发重建”的链路可见。
@@ -190,7 +167,9 @@ def search_records(
     top_k: int | None = None,
     embedder: Any | None = None,
     model_path: str | None = None,
+    message_top_k: int | None = None,
 ) -> list[dict[str, Any]]:
+    resolved_message_top_k = resolve_message_top_k(message_top_k)
     normalized_query = str(query or "").strip()
     if not normalized_query:
         raise ValueError("query is required")
@@ -254,33 +233,16 @@ def search_records(
         if not entry_id:
             continue
         direct_entry_ids.add(entry_id)
-    fetched_direct_entries = fetch_store_entries_by_ids(list(direct_entry_ids)) if direct_entry_ids else []
-    direct_entry_map = {
-        str(entry.get("id") or "").strip(): entry
-        for entry in fetched_direct_entries
-    }
-    source_memory_ids = {
-        str(entry.get("source_memory_id") or "").strip()
-        for entry in fetched_direct_entries
-        if is_field_record_entry(entry) and str(entry.get("source_memory_id") or "").strip()
-    }
-    family_entries = fetch_entry_family_by_source_ids(source_memory_ids) if source_memory_ids else []
-    family_entry_map = {
-        str(entry.get("id") or "").strip(): entry
-        for entry in family_entries
-    }
-    public_entry_map = {
-        str(entry.get("id") or "").strip(): entry
-        for entry in fetched_direct_entries
-        if not is_field_record_entry(entry)
-    }
-    public_entry_map.update(
-        {
-        str(entry.get("id") or "").strip(): entry
-        for entry in family_entries
-        if not is_field_record_entry(entry)
-        }
+    # Preserve explicit legacy configurations that ask search to return full chats.
+    # The default lightweight fields never load or decode the full dialogue.
+    include_dialogue = "raw_dialogue" in SEARCH_RESULT_FIELDS
+    search_records_view = read_search_records(
+        list(direct_entry_ids),
+        read_entries=fetch_store_entries_by_ids if include_dialogue else fetch_search_entries_by_ids,
+        read_parents=fetch_public_memory_entries_by_ids if include_dialogue else fetch_search_parents_by_ids,
     )
+    direct_entry_map = search_records_view.direct_by_id
+    public_entry_map = search_records_view.public_by_id
 
     aggregated_results: dict[str, dict[str, Any]] = {}
     matched_field_scores: dict[str, dict[str, float]] = {}
@@ -291,7 +253,7 @@ def search_records(
         entry_id = str(row_ids[row_index] or "").strip()
         if not entry_id:
             continue
-        matched_entry = direct_entry_map.get(entry_id) or family_entry_map.get(entry_id)
+        matched_entry = direct_entry_map.get(entry_id)
         if matched_entry is None:
             continue
         if is_field_record_entry(matched_entry):
@@ -327,7 +289,11 @@ def search_records(
             if isinstance(segment, dict):
                 message_id = segment.get("message_id")
                 message_index = segment.get("message_index")
-                if isinstance(message_id, str) and message_id and type(message_index) is int and message_index >= 0:
+                if (
+                    isinstance(message_id, str) and message_id
+                    and type(message_index) is int and message_index >= 0
+                    and math.isfinite(float(score))
+                ):
                     message_scores = matched_message_scores.setdefault(result_id, {})
                     previous = message_scores.get(message_id)
                     if previous is None or float(score) > previous[0]:
@@ -348,7 +314,10 @@ def search_records(
     for result in sorted_results[:resolved_top_k]:
         result_id = str(result.get("id") or "").strip()
         if public_entry_map[result_id].get("memory_kind") == "chat_event":
-            result["matched_message_ids"] = select_matched_message_ids(matched_message_scores.get(result_id, {}))
+            result["matched_messages"] = select_matched_messages(
+                matched_message_scores.get(result_id, {}), resolved_message_top_k
+            )
+            result["matched_message_ids"] = [message["message_id"] for message in result["matched_messages"]]
         field_score_map = matched_field_scores.get(result_id) or {}
         if field_score_map:
             result["matched_fields"] = [
@@ -1020,22 +989,35 @@ def update(
     name="search",
     description=(
         "按向量相似度检索已保存的项目经验、项目摘要、会话事件和事实记忆，返回最相关的 top-k 条轻量候选记录。"
+        "查询优先使用简洁、自足的自然语言，保留关键实体、关系、时间条件和要查的问题；避免机械压缩为关键词或直接粘贴整段聊天。"
+        "top_k 限制主记忆数量；message_top_k 限制每条聊天记忆的代表消息数量，默认以配置为准（缺省3条）。"
+        "matched_messages 返回代表消息 ID 和相似度，按分数降序选取且锚点不落入彼此的上下文窗口。"
+        "相似度不是事实正确的概率，历史命中不代表当前事实。"
         "需要详情时调用 get_details_by_ids，并将各结果的 matched_message_ids 按记录 id 分组透传，读取命中消息上下文。"
+        "聊天详情只传主记忆 id 且未请求全文时会读取末尾预览，不会自动沿用本次 search 的命中消息。"
     ),
 )
 def search(
     query: Annotated[
         str,
-        Field(description="必填。用于向量检索的查询文本，可以是问题、关键词、故障现象或主题。"),
+        Field(description="必填。用于向量检索的查询文本，优先使用保留关键实体、关系和时间条件的简洁问题；也支持关键词、故障现象或主题。"),
     ],
     top_k: Annotated[
         int,
         Field(
             default=5,
-            description="可选。期望返回的结果条数；不传默认 5，超过系统上限会自动截断。",
+            description="可选。期望返回的主记忆条数，不是消息数量；不传默认 5，超过系统上限会自动截断。",
         ),
     ] = 5,
+    message_top_k: Annotated[
+        int | None,
+        Field(
+            default=None, strict=True, gt=0,
+            description="可选。每条聊天记忆最多返回的代表消息数，必须为正整数；省略或 null 使用 search.message_top_k 配置，配置缺失默认3。先按记录内分差筛选，再排除距离已选消息不超过 results.returnMessageNum 的候选，不足时不凑数。",
+        ),
+    ] = None,
 ) -> dict[str, Any]:
+    resolved_message_top_k = resolve_message_top_k(message_top_k)
     rebuild_state = load_rebuild_state()
     resolved_top_k = 5 if top_k is None else max(1, min(int(top_k), MAX_TOP_K))
     rebuild_state_name = str(rebuild_state.get("state") or "").strip()
@@ -1043,6 +1025,7 @@ def search(
         response = {
             "query": query,
             "top_k": resolved_top_k,
+            "message_top_k": resolved_message_top_k,
             "results": [],
             "search_available": False,
             "rebuild_state": "running",
@@ -1056,6 +1039,7 @@ def search(
         return {
             "query": query,
             "top_k": resolved_top_k,
+            "message_top_k": resolved_message_top_k,
             "results": [],
             "search_available": False,
             "rebuild_state": "failed",
@@ -1063,10 +1047,11 @@ def search(
             "message": "索引重建上一次失败了；先触发一次新的写入，让系统重新重建索引，再继续 search。",
             "last_error": str(rebuild_state.get("last_error") or ""),
         }
-    results = search_records(query=query, top_k=top_k)
+    results = search_records(query=query, top_k=top_k, message_top_k=resolved_message_top_k)
     return {
         "query": query,
         "top_k": resolved_top_k,
+        "message_top_k": resolved_message_top_k,
         "results": results,
     }
 
@@ -1078,9 +1063,13 @@ def search(
         "按记录 ids 读取一批项目经验、会话事件或事实记忆的详情。"
         "服务端根据 id 前缀直查对应的 SQLite 物理详情表；未知旧前缀会回查 memory_registry。"
         "chat_event 默认返回 raw_dialogue 只读上下文视图；透传 search 的 matched_message_ids 可定位命中消息。"
-        "默认前后各扩展10条、每条记录最多40条真实消息，具体以配置为准；未提供定位时返回末尾预览。"
+        "每个锚点前后各扩展 results.returnMessageNum 条（默认10），完整返回窗口并去重，不设40条上限。"
+        "chat_event 在 full_dialogue=false 且只传主记忆 ids 或无有效锚点时返回末尾 2*returnMessageNum+1 条预览（默认最多21条），不是全文；不使用上一次 search 的命中状态。"
+        "用 context.mode=tail_preview 识别预览，定位失效的消息 ID 在 context.unresolved_message_ids 中返回。"
+        "message_top_k 仅限制 search，直接传入多个锚点不受其限制；历史命中不代表当前事实。"
         "context 说明裁剪状态，messages 中 type=omission 表示省略区间，不是实际对话消息。"
         "归档查重、合并写入或需要全文时必须传 full_dialogue=true；禁止将上下文视图直接回写 update。"
+        "其他记忆类型返回完整详情，不进行消息裁剪。"
         "如果部分 id 不存在，会在 missing_ids 中显式返回。"
     ),
 )
@@ -1088,13 +1077,13 @@ def get_details_by_ids(
     ids: Annotated[
         list[str],
         Field(
-            description="必填。要读取的记录 id 数组。即使只查一条，也需要传 ids=[\"eventMemId-xxxx\"]。",
+            description="必填。要读取的主记忆 id 数组，不接受消息 msg-* 或内部 fmem-* 作为详情定位。即使只查一条也传 ids=[\"eventMemId-xxxx\"]；只传 ids 默认读取聊天末尾预览。",
             json_schema_extra={"examples": [["eventMemId-123456789abc", "factMemId-abcdef123456"]]},
         ),
     ],
     matched_message_ids: Annotated[
         dict[str, list[str]] | None,
-        Field(description="可选。按记录 id 分组的 search 命中消息 ID，保留其相关性顺序，例如 {\"eventMemId-xxx\": [\"msg-1\", \"msg-2\"]}。"),
+        Field(description="可选。按主记忆 id 分组的消息 ID，键必须属于 ids；可根据 search 的评分选取部分消息，例如 {\"eventMemId-xxx\": [\"msg-1\", \"msg-2\"]}。消息 ID 不保证全库唯一；省略或空列表返回末尾预览，不自动沿用上次 search。"),
     ] = None,
     full_dialogue: Annotated[
         bool,

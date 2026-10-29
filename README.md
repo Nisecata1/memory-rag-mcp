@@ -8,6 +8,18 @@
 - 项目配置：`AI-memory/memory-rag-mcp/config/settings.yaml`
 - 传输方式：`stdio`
 
+## 文档导航
+
+| 需要了解什么 | 阅读位置 |
+| --- | --- |
+| 部署、配置、数据位置及写接口 | 本 README |
+| 搜索评分、消息选择、详情读取和调用边界 | [检索与详情接口契约](docs/retrieval-api.md) |
+| 核心服务的数据读取分工及归档 Agent 自由查库边界 | [数据读取说明](docs/storage-access.md) |
+| 本次优化、接口变化、验证及升级范围 | [2026-10-29 变更说明](docs/changes-2026-10-29.md) |
+| AI 调用时能看到的简短约定 | `server.py` 的工具和参数描述，通过 MCP 工具列表暴露 |
+
+检索与详情的完整契约集中维护在 `docs/retrieval-api.md`；下面仅保留速查，避免多份详细文档各自演化。行为变更需同步文档、工具描述和对应测试，不能只改客户端缓存。
+
 ## 项目特点
 ![memory-rag-mcp overview](assets/readme-overview.png)
 **SQLite 作为主数据来源接入**
@@ -67,8 +79,9 @@ project_registry 不再要求调用方传 short_summary；如果统一返回结�
   - 开启后，服务端先把多个向量命中折叠到主记忆并取最高分，再按 `score >= min_similarity` 过滤，最后执行 `top_k` 截取，因此返回数量可能少于 `top_k`。
   - 修改后需要重启 MCP；该配置只影响结果裁剪，不改变向量文本、FAISS 或索引签名，也不需要重建索引。
 - `search.message_score_gap` 默认 `0.2`，必须为非负有限数，控制同一聊天记录内的消息命中分差。
+- `search.message_top_k` 默认 `3`，必须为正整数，限制每条聊天记忆的代表消息数；`search` 可单次覆盖，省略或传 `null` 使用配置值。
 - `results.returnMessageNum` 默认 `10`，必须为非负整数，表示命中消息前后各扩展的消息条数。
-- `results.max_total_messages` 默认 `40`，必须为正整数，限制每条聊天详情返回的真实消息数和搜索返回的消息锚点数。
+- 已取消详情固定 40 条上限；旧配置的 `results.max_total_messages` 即使残留也不再读取或生效。
 - 缺少上述新增配置时使用默认值；修改后重启所有相关 MCP 进程生效，不改变切片、向量或索引签名，无需数据迁移或索引重建。
 - 消息按 `messages` 数组中的单条记录计数，不按一问一答计数；这些配置不限制单条消息长度或整批响应的字符/token 数。
 
@@ -500,109 +513,25 @@ meta_NpyRow-to-id.json <- sorted_entries 中真正有检索文本的 id 顺序
   - 用于提示调用方：主数据已经更新，但索引仍在后台补齐。
 ## `search` 接口
 
-### 功能说明
+完整参数、字段、筛选规则和异常返回见 [检索与详情接口契约](docs/retrieval-api.md)。
 
-- 用于按语义相似度检索历史项目经验、会话事件和事实记忆。
-- `search` 不直接从时间线 Markdown 检索，而是先查 `FAISS`，再用 `meta` 中的 `row_to_id` 回源 `SQLite` 主数据。
-- `search` 只负责返回轻量候选结果，不承担完整详情读取。
-- 如果命中的是内部 `field_record`，服务端会先折叠回源到它的源头主记忆，再把主记忆返回给调用方。
-- 需要详情时，调用 `get_details_by_ids` 并按记录 id 分组透传 `matched_message_ids`；聊天全文须显式指定 `full_dialogue=true`。
-- 如果后台全量重建仍在运行，`search` 会直接拒绝并返回状态对象，不会继续返回旧索引结果。
-- 如果上一次后台重建失败，`search` 也会返回状态对象，并附带最近一次重建错误文本。
-
-### 输入字段
-
-- `query`
-  - 必填。
-  - 查询文本，可以是问题、关键词、故障现象、主题、组件名、报错信息等。
-- `top_k`
-  - 可选。
-  - 期望返回的结果条数。
-  - 默认 `5`，最大 `20`。
-
-### 返回字段
-
-- `query`
-  - 本次实际执行检索的查询文本。
-- `top_k`
-  - 归一化后的返回条数上限。
-- `results`
-  - 检索命中的记录列表。
-  - 每条结果包含轻量候选字段和一个 `score`。
-  - 当前轻量字段包括：
-    - `id`
-    - `score`
-    - `memory_kind`
-    - `updated_at`
-    - `created_at`
-    - `title`
-    - `short_summary`
-    - `tags`
-    - `reference_doc_path`
-    - `matched_fields`
-      - 可选。
-      - 只有在该主记忆是因为内部字段级子记忆命中而被召回时才返回。
-      - 值是字段名数组，按贡献度排序，最多 3 个。
-- `results[].matched_message_ids` 仅对 `chat_event` 返回；没有消息级命中时为空数组。
-- 同一消息的多个切片取最高分；每条聊天记录独立计算最高消息分，保留分差不超过 `search.message_score_gap` 的消息，不与标题等字段分数比较。
-- 消息 ID 按分数降序、同分按原消息顺序排列，最多 `results.max_total_messages` 个；不改变原有主记录排序、`top_k` 或 `matched_fields`。
-- `search_available`
-  - 仅在索引正在后台重建或上一次重建失败时返回。
-  - `false` 表示当前不能安全使用 `search`。
-- `rebuild_state`
-  - 仅在 `search_available=false` 时返回。
-  - 当前可能值包括：
-    - `running`
-    - `failed`
-- `index_refresh_reason`
-  - 仅在 `search_available=false` 时返回。
-  - 与 `rebuild_state.json` 中的同名字段一致，说明本次后台重建的触发原因。
-- `message`
-  - 仅在 `search_available=false` 时返回。
-  - 用于说明当前为什么不能继续 `search`。
-- `last_error`
-  - 仅在 `rebuild_state=failed` 时返回。
-  - 保存最近一次后台重建失败时的错误文本。
+- `search(query, top_k=5, message_top_k=null)` 返回轻量主记忆候选，不返回消息正文。
+- `top_k` 限制主记忆数量，当前配置最多 20；`message_top_k` 限制每条聊天记忆的代表消息数，默认 3，可单次覆盖。
+- 聊天结果的 `matched_messages` 提供消息 ID 和评分，`matched_message_ids` 与之严格对应；同一片上下文内不重复选取代表锚点。
+- 调用者根据评分选择消息，并将主记忆 ID 和分组的消息 ID 一起交给详情接口。只传主 ID 不会自动沿用搜索定位。
+- 后台重建中或失败时 `search_available=false`，不是“没有相关记忆”。相似度不是事实正确的概率，历史命中不代表当前事实。
 
 ## `get_details_by_ids` 接口
 
-### 功能说明
+完整参数、定位失效处理、返回字段和回写保护见 [检索与详情接口契约](docs/retrieval-api.md)。接口不重新检索，也不记住上一次 `search`。
 
-- 用于按记录 `ids` 批量读取详情；`chat_event` 默认返回命中消息上下文，其他类型保持完整详情。
-- 这个接口不做向量搜索，只负责按主键回源主数据。
-- 服务端先根据 id 前缀判断记忆类型，再直接查询对应物理详情表；未知旧前缀会回查 `memory_registry`。
-- 详情读取不经过 `public_memory_view`，也不依赖全局详情字段白名单。
-- 即使只读取一条，也应传单元素数组。
-- 如果部分 id 不存在，接口不会整体报错，而是通过 `missing_ids` 显式返回缺失项。
-- `field_record` 属于内部索引资产，不能通过这个接口直接读取。
+| 聊天详情请求 | 默认返回（前后半径为 10） |
+| --- | --- |
+| 只传主记忆 `ids` | 每条会话末尾最多 21 条预览，不是自动命中上下文 |
+| 传 `ids` 和分组的 `matched_message_ids` | 各有效消息及前后各 10 条，窗口合并去重 |
+| 传 `full_dialogue=true` | 原始完整对话，不添加 `context` 或省略项 |
 
-### 输入字段
-
-- `ids`
-  - 必填。
-  - 要读取的记录 id 数组。
-  - 即使只查一条，也要传 `ids=["eventMemId-xxxx"]`。
-  - 通常来自 `search` 结果中的 `id`。
-- `matched_message_ids` 可选，格式为 `{记录ID: [消息ID, ...]}`，键必须属于本次请求的 `ids`；按搜索返回的顺序透传，避免不同聊天记录的同名消息 ID 混用。
-- `full_dialogue` 可选，默认 `false`；为 `true` 时忽略消息锚点并返回原始完整 `raw_dialogue`，不添加省略项或只读标记，也不受消息数量上限限制。
-
-### 返回字段
-
-- `ids`
-  - 清洗后的请求 id 列表；重复 id 只保留首次出现的一项。
-- `records`
-  - 已成功命中的详情记录列表。
-  - 顺序与输入 `ids` 保持一致。
-  - 所有类型都返回 `id`、`memory_kind`、`created_at`、`updated_at`，并追加自身物理表对应的业务字段。
-  - `project_record` 返回项目分析、步骤、验证、详细总结及 `project_id` 等项目字段。
-  - `chat_event` 返回 `title`、`short_summary`、`raw_dialogue`、标签和来源字段，不返回 legacy `detailed_summary`。
-  - `fact` 返回 `title`、`short_summary`、`detailed_summary`、标签和来源字段。
-  - `project_registry` 返回 `title`、`overview_summary`、标签和来源字段，并保留 `project_id=id` 的业务别名。
-  - `tags_json`、`source_paths_json` 会转换成 `tags`、`source_paths` 数组；`retrieval_fields_json` 不对外返回。
-- `missing_ids`
-  - 本次请求中未找到的 id 列表。
-
-### 聊天上下文视图
+按搜索命中读取的请求示例：
 
 ```json
 {
@@ -612,22 +541,11 @@ meta_NpyRow-to-id.json <- sorted_entries 中真正有检索文本的 id 顺序
 }
 ```
 
-- 在当前 SQLite 正文中按消息 ID 定位，去重后保留输入优先级；不重跑向量检索，不依赖上次搜索的进程内状态。
-- 先保留有效锚点，超出总上限时只保留优先级最高的锚点；剩余名额按距离从近到远、同距离按锚点优先级、同锚点先前后后的顺序补充上下文。
-- 每个锚点最多向前和向后各扩展 `returnMessageNum` 条，重叠消息不重复占额度，最终按原对话顺序输出。
-- 无锚点时返回末尾 `min(2 * returnMessageNum + 1, max_total_messages)` 条，默认 21 条；部分锚点失效时使用有效项，全部失效时明确降级为末尾预览。
-- 原消息的角色、ID、正文和元数据保留；所有被跳过的连续区间，包括开头和结尾，都插入独立省略项。重叠或相邻窗口之间没有省略项。
-
-```json
-{"type": "omission", "omitted_count": 128, "content": "[... 省略 128 条消息 ...]"}
-```
-
-- 省略项不计入真实消息上限，也不带用户或助手角色。
-- `raw_dialogue.context.mode` 为 `matched_context` 或 `tail_preview`；`reason` 为 `matched_messages`、`no_anchors` 或 `anchors_not_found`，不会把预览冒充命中上下文。
-- `context` 还包含 `total_messages`、`returned_messages`、`truncated`、实际使用的 `anchor_message_ids`、失效的 `unresolved_message_ids` 和因上限丢弃的 `omitted_anchor_count`。
-- 默认视图始终是只读的，即使消息数较少没有裁剪，也不能直接传给 `save_chatEvent` 或 `update`；替换正文前必须先以 `full_dialogue=true` 读取全文。
-- 自动归档的查重、历史合并和更新恢复均显式读取全文，并校验没有上下文标记或省略项；无法确认完整格式时停止写入。
-- 旧的非结构化正文不能自动定位消息，需显式全文读取；默认视图不修改 SQLite 中的原始数据。
+- `ids` 是主记忆 ID；`msg-*` 必须放在所属会话的定位列表中，不能直接作为 `ids`。不能读取内部 `fmem-*`。
+- 返回 `ids`、`records`、`missing_ids`。其他记忆类型保持完整详情；聊天默认视图带只读 `context`，省略项不是实际消息。
+- 有效锚点完整展开；全部失效会返回标明失效的末尾预览。调用者应检查 `context.mode` 和 `unresolved_message_ids`，不要把预览当成命中证据。
+- 不设固定 40 条上限。搜索默认 3 个锚点最多展开 63 条真实消息；直接传入更多锚点不受搜索限额约束，也没有单条文字或整批 token 上限。
+- 默认视图即使未裁剪也不能直接回写正文。归档查重、合并和恢复必须显式请求全文并验证完整格式。
 
 ## `delete_by_ids` 接口
 

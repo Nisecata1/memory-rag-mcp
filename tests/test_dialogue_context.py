@@ -48,30 +48,47 @@ class DialogueContextTests(unittest.TestCase):
         self.stack = ExitStack()
         self.addCleanup(self.stack.close)
         self.stack.enter_context(patch.object(utils, "RETURN_MESSAGE_NUM", 10))
-        self.stack.enter_context(patch.object(utils, "MAX_TOTAL_MESSAGES", 40))
+        self.stack.enter_context(patch.object(utils, "MESSAGE_TOP_K", 3))
         self.stack.enter_context(patch.object(utils, "MESSAGE_SCORE_GAP", 0.2))
 
     def test_config_defaults_and_validation(self) -> None:
-        self.assertEqual(utils.parse_dialogue_return_config({}, {}), (0.2, 10, 40))
+        self.assertEqual(utils.parse_dialogue_return_config({}, {}), (0.2, 10, 3))
         for key, invalids in (
             ("message_score_gap", [True, None, "0.2", -0.1, float("nan"), float("inf")]),
             ("returnMessageNum", [False, None, "10", 1.5, -1]),
-            ("max_total_messages", [True, None, "40", 2.5, 0, -1]),
+            ("message_top_k", [True, False, None, "3", 3.0, 0, -1]),
         ):
             for value in invalids:
                 with self.subTest(key=key, value=value), self.assertRaises(RuntimeError):
                     utils.parse_dialogue_return_config(
-                        {key: value} if key == "message_score_gap" else {},
-                        {} if key == "message_score_gap" else {key: value},
+                        {} if key == "returnMessageNum" else {key: value},
+                        {key: value} if key == "returnMessageNum" else {},
                     )
         self.assertEqual(
-            utils.parse_dialogue_return_config({"message_score_gap": 0}, {"returnMessageNum": 0, "max_total_messages": 1}),
+            utils.parse_dialogue_return_config({"message_score_gap": 0, "message_top_k": 1}, {"returnMessageNum": 0}),
             (0.0, 0, 1),
         )
+        for old_limit in (40, 1, None, False, "obsolete"):
+            with self.subTest(old_limit=old_limit):
+                self.assertEqual(utils.parse_dialogue_return_config({}, {"max_total_messages": old_limit}), (0.2, 10, 3))
+
+    def test_message_limit_default_override_and_strict_validation(self) -> None:
+        with patch.object(utils, "MESSAGE_TOP_K", 5):
+            self.assertEqual(utils.resolve_message_top_k(), 5)
+            self.assertEqual(utils.resolve_message_top_k(None), 5)
+            self.assertEqual(utils.resolve_message_top_k(1), 1)
+        for invalid in (True, False, "3", 3.0, 0, -1):
+            with self.subTest(value=invalid), self.assertRaisesRegex(ValueError, "positive integer"):
+                utils.resolve_message_top_k(invalid)
+            with patch.object(server, "load_rebuild_state") as load_state:
+                with self.assertRaisesRegex(ValueError, "positive integer"):
+                    server.search("query", message_top_k=invalid)
+                load_state.assert_not_called()
 
     def test_config_load_defaults_and_no_retrieval_signature_change(self) -> None:
         config = yaml.safe_load(utils.CONFIG_PATH.read_text(encoding="utf-8"))
         config["search"].pop("message_score_gap", None)
+        config["search"].pop("message_top_k", None)
         config["results"].pop("returnMessageNum", None)
         config["results"].pop("max_total_messages", None)
         with tempfile.TemporaryDirectory() as directory:
@@ -80,21 +97,50 @@ class DialogueContextTests(unittest.TestCase):
             with patch.object(utils, "CONFIG_PATH", path):
                 defaults = utils.load_project_config()
                 config["search"]["message_score_gap"] = 0.05
+                config["search"]["message_top_k"] = 5
                 config["results"].update(returnMessageNum=3, max_total_messages=9)
                 path.write_text(yaml.safe_dump(config), encoding="utf-8")
                 changed = utils.load_project_config()
-        self.assertEqual((defaults["message_score_gap"], defaults["return_message_num"], defaults["max_total_messages"]), (0.2, 10, 40))
-        self.assertEqual((changed["message_score_gap"], changed["return_message_num"], changed["max_total_messages"]), (0.05, 3, 9))
+        self.assertEqual((defaults["message_score_gap"], defaults["return_message_num"], defaults["message_top_k"]), (0.2, 10, 3))
+        self.assertEqual((changed["message_score_gap"], changed["return_message_num"], changed["message_top_k"]), (0.05, 3, 5))
+        self.assertNotIn("max_total_messages", changed)
         for key in ("retrieval_field_candidates", "chat_event_chunk_max_tokens", "chat_event_chunk_overlap_tokens"):
             self.assertEqual(defaults[key], changed[key])
+        for loaded in (defaults, changed):
+            self.assertEqual("|".join(loaded["retrieval_field_candidates"]), utils.RETRIEVAL_FIELD_SIGNATURE)
+            self.assertEqual(
+                f"chat_dialogue_v1|roles=user,assistant|chunk_max={loaded['chat_event_chunk_max_tokens']}|chunk_overlap={loaded['chat_event_chunk_overlap_tokens']}",
+                utils.FIELD_RECORD_DERIVATION_SIGNATURE,
+            )
 
     def test_score_boundary_ties_and_limit(self) -> None:
-        scores = {"late": (0.8, 7), "early": (0.8, 2), "boundary": (0.6, 8), "outside": (0.599, 9)}
-        self.assertEqual(utils.select_matched_message_ids(scores), ["early", "late", "boundary"])
-        scores = {f"msg-{i}": (0.5, i) for i in reversed(range(60))}
-        self.assertEqual(utils.select_matched_message_ids(scores), [f"msg-{i}" for i in range(40)])
+        scores = {"late": (0.8, 11), "early": (0.8, 0), "boundary": (0.6, 22), "outside": (0.599, 33)}
+        selected = utils.select_matched_messages(scores)
+        self.assertEqual(selected, [
+            {"message_id": "early", "score": 0.8},
+            {"message_id": "late", "score": 0.8},
+            {"message_id": "boundary", "score": 0.6},
+        ])
+        scores = {f"msg-{i}": (0.5, i * 11) for i in reversed(range(60))}
+        self.assertEqual([item["message_id"] for item in utils.select_matched_messages(scores)], [f"msg-{i}" for i in range(3)])
+        self.assertEqual(len(utils.select_matched_messages(scores, 50)), 50)
         with patch.object(utils, "MESSAGE_SCORE_GAP", 0):
-            self.assertEqual(utils.select_matched_message_ids({"a": (0.8, 0), "b": (0.8 - 1e-8, 1)}), ["a"])
+            self.assertEqual(utils.select_matched_messages({"a": (0.8, 0), "b": (0.8 - 1e-8, 11)}), [{"message_id": "a", "score": 0.8}])
+
+    def test_distance_boundary_and_rejected_candidates_do_not_suppress(self) -> None:
+        scores = {"best": (0.95, 20), "inside": (0.94, 30), "next": (0.9, 31), "far": (0.8, 80)}
+        self.assertEqual([item["message_id"] for item in utils.select_matched_messages(scores)], ["best", "next", "far"])
+        self.assertEqual(len(utils.select_matched_messages(scores, 1)), 1)
+        chain = {"a": (0.9, 0), "b": (0.89, 10), "c": (0.88, 20)}
+        self.assertEqual([item["message_id"] for item in utils.select_matched_messages(chain)], ["a", "c"])
+        self.assertEqual(utils.select_matched_messages({}), [])
+
+    def test_nonfinite_scores_negative_scores_and_id_tiebreak(self) -> None:
+        scores = {"nan": (float("nan"), 0), "inf": (float("inf"), 30), "negative-inf": (float("-inf"), 40), "b": (-0.1, 10), "a": (-0.1, 10), "later": (-0.2, 11)}
+        with patch.object(utils, "RETURN_MESSAGE_NUM", 0):
+            self.assertEqual(utils.select_matched_messages(scores), [
+                {"message_id": "a", "score": -0.1}, {"message_id": "later", "score": -0.2},
+            ])
 
     def test_single_window_preserves_original_messages_and_metadata(self) -> None:
         source = dialogue(100)
@@ -134,21 +180,30 @@ class DialogueContextTests(unittest.TestCase):
         self.assertTrue(all("role" not in item and "message_id" not in item for item in omissions))
         self.assertEqual(sum(item["omitted_count"] for item in omissions) + view["context"]["returned_messages"], 50)
 
-    def test_budget_keeps_anchors_then_nearest_neighbors(self) -> None:
-        with patch.object(utils, "MAX_TOTAL_MESSAGES", 7):
-            view = utils.build_dialogue_context(dialogue(80), ["msg-20", "msg-60"])
-        self.assertEqual(returned_ids(view), ["msg-18", "msg-19", "msg-20", "msg-21", "msg-59", "msg-60", "msg-61"])
-        view = utils.build_dialogue_context(dialogue(100), ["msg-20", "msg-70"])
-        self.assertEqual(view["context"]["returned_messages"], 40)
-        self.assertEqual(returned_ids(view), [f"msg-{i}" for i in range(10, 31)] + [f"msg-{i}" for i in range(61, 80)])
+    def test_three_windows_are_complete_without_40_message_cap(self) -> None:
+        view = utils.build_dialogue_context(dialogue(120), ["msg-20", "msg-60", "msg-100"])
+        self.assertEqual(view["context"]["returned_messages"], 63)
+        self.assertEqual(view["context"]["omitted_anchor_count"], 0)
+        self.assertEqual(returned_ids(view), [f"msg-{i}" for start in (10, 50, 90) for i in range(start, start + 21)])
+        self.assertEqual(sum(item["omitted_count"] for item in view["messages"] if item.get("type") == "omission"), 57)
+
+    def test_representative_windows_can_overlap(self) -> None:
+        view = utils.build_dialogue_context(dialogue(60), ["msg-20", "msg-35"])
+        self.assertEqual(returned_ids(view), [f"msg-{i}" for i in range(10, 46)])
+        self.assertEqual(view["context"]["returned_messages"], 36)
+
+    def test_tail_preview_is_not_capped_at_40(self) -> None:
+        with patch.object(utils, "RETURN_MESSAGE_NUM", 25):
+            view = utils.build_dialogue_context(dialogue(100))
+        self.assertEqual(view["context"]["returned_messages"], 51)
 
     def test_excess_anchors_duplicates_and_unresolved_ids(self) -> None:
         anchors = [f"msg-{i}" for i in reversed(range(50))]
         view = utils.build_dialogue_context(dialogue(60), [anchors[0], *anchors, "gone"])
-        self.assertEqual(view["context"]["anchor_message_ids"], anchors[:40])
-        self.assertEqual(view["context"]["omitted_anchor_count"], 10)
+        self.assertEqual(view["context"]["anchor_message_ids"], anchors)
+        self.assertEqual(view["context"]["omitted_anchor_count"], 0)
         self.assertEqual(view["context"]["unresolved_message_ids"], ["gone"])
-        self.assertEqual(returned_ids(view), [f"msg-{i}" for i in range(10, 50)])
+        self.assertEqual(returned_ids(view), [f"msg-{i}" for i in range(60)])
 
     def test_no_anchor_or_stale_anchor_returns_labeled_tail(self) -> None:
         for anchors, reason in ((None, "no_anchors"), (["gone"], "anchors_not_found")):
@@ -239,6 +294,11 @@ class DialogueDetailIntegrationTests(unittest.TestCase):
                     context = await read({"ids": ["eventMemId-a"], "matched_message_ids": {"eventMemId-a": ["msg-20"]}})
                     view = context["records"][0]["raw_dialogue"]
                     self.assertEqual(returned_ids(view), [f"msg-{i}" for i in range(10, 31)])
+                    windows = await read({"ids": ["eventMemId-a"], "matched_message_ids": {"eventMemId-a": ["msg-10", "msg-40", "msg-69"]}})
+                    self.assertEqual(windows["records"][0]["raw_dialogue"]["context"]["returned_messages"], 63)
+                    many = await read({"ids": ["eventMemId-a"], "matched_message_ids": {"eventMemId-a": [f"msg-{i}" for i in range(70)]}})
+                    self.assertEqual(len(many["records"][0]["raw_dialogue"]["context"]["anchor_message_ids"]), 70)
+                    self.assertEqual(many["records"][0]["raw_dialogue"]["context"]["returned_messages"], 80)
                     rejected = await session.call_tool("update", {"id": "eventMemId-a", "changes": {"raw_dialogue": view}}, read_timeout_seconds=timedelta(seconds=10))
                     self.assertTrue(rejected.isError)
                     self.assertIn("read-only context view", str(rejected.content))
@@ -252,22 +312,105 @@ class DialogueDetailIntegrationTests(unittest.TestCase):
         self.assertEqual(schema["required"], ["ids"])
         self.assertIn("matched_message_ids", schema["properties"])
         self.assertFalse(schema["properties"]["full_dialogue"]["default"])
+        search_tool = next(tool for tool in tools if tool.name == "search")
+        search_schema = search_tool.inputSchema
+        self.assertEqual(search_schema["required"], ["query"])
+        self.assertIsNone(search_schema["properties"]["message_top_k"]["default"])
+        self.assertIn("message_top_k", search_tool.description)
+        detail_tool = next(tool for tool in tools if tool.name == "get_details_by_ids")
+        self.assertNotIn("最多40条", detail_tool.description)
+        self.assertIn("默认最多21条", detail_tool.description)
+        self.assertIn("不使用上一次 search", detail_tool.description)
+        self.assertIn("context.mode=tail_preview", detail_tool.description)
+        self.assertIn("主记忆", schema["properties"]["ids"]["description"])
+        self.assertIn("末尾预览", schema["properties"]["matched_message_ids"]["description"])
+        self.assertIn("不会自动沿用", search_tool.description)
+
+    def test_search_envelope_config_override_and_rebuild_states(self) -> None:
+        with patch.object(utils, "MESSAGE_TOP_K", 5):
+            for state in ("idle", "running", "failed"):
+                for override, expected in ((None, 5), (2, 2)):
+                    with self.subTest(state=state, override=override):
+                        with patch.object(server, "load_rebuild_state", return_value={"state": state}), patch.object(server, "search_records", return_value=[]) as search_records:
+                            result = server.search("query", top_k=2, message_top_k=override)
+                        self.assertEqual(result["message_top_k"], expected)
+                        self.assertEqual(result["top_k"], 2)
+                        if state == "idle":
+                            search_records.assert_called_once_with(query="query", top_k=2, message_top_k=expected)
+                        else:
+                            search_records.assert_not_called()
+                            self.assertFalse(result["search_available"])
+                            self.assertEqual(result["rebuild_state"], state)
+
+    def test_stdio_search_scores_limits_and_strict_validation(self) -> None:
+        root = utils.SQLITE_PATH.parent
+        model = root / "model"
+        model.mkdir()
+        (model / "config.json").write_text("{}", encoding="utf-8")
+        entries = list(self.entries)
+        for parent in self.entries[:2]:
+            for index in range(0, 80, 11):
+                entries.append(utils.build_chat_dialogue_field_record_entry(
+                    parent["id"], {"message_id": f"msg-{index}", "message_index": index, "role": "user", "content": "text", "chunk_index": 0, "chunk_count": 1},
+                    parent["created_at"], parent["updated_at"],
+                ))
+        with closing(utils.get_sqlite_connection()) as connection:
+            utils.upsert_store_entries(entries, connection=connection)
+            connection.commit()
+        with ExitStack() as stack:
+            for name, path in {
+                "META_PATH": root / "data" / "meta.json",
+                "INDEX_PATH": root / "data" / "memory.faiss",
+                "EMBEDDINGS_PATH": root / "data" / "memory_embeddings.npy",
+            }.items():
+                stack.enter_context(patch.object(utils, name, path))
+            vectors = np.full((len(entries), 8), 1 / np.sqrt(8), dtype="float32")
+            utils.rebuild_index_from_embeddings([entry["id"] for entry in entries], vectors, str(model), utils.build_embedding_model_fingerprint(str(model)))
+
+        async def check_protocol() -> None:
+            params = StdioServerParameters(
+                command=sys.executable,
+                args=[str(Path(__file__).with_name("concurrent_stdio_worker.py"))],
+                cwd=str(Path(server.__file__).parent),
+                env={**os.environ, "MEMORY_RAG_TEST_ROOT": str(root), "MEMORY_RAG_WORKER_MODE": "stdio"},
+            )
+            with open(os.devnull, "w", encoding="utf-8") as errors:
+                async with stdio_client(params, errlog=errors) as streams, ClientSession(*streams) as session:
+                    await session.initialize()
+                    for extra, expected in (({}, 3), ({"message_top_k": None}, 3), ({"message_top_k": 1}, 1), ({"message_top_k": 5}, 5)):
+                        response = await session.call_tool("search", {"query": "query", "top_k": 3, **extra}, read_timeout_seconds=timedelta(seconds=10))
+                        self.assertFalse(response.isError, str(response.content))
+                        result = json.loads(next(block.text for block in response.content if block.type == "text"))
+                        self.assertEqual(result["message_top_k"], expected)
+                        chats = [entry for entry in result["results"] if entry["memory_kind"] == "chat_event"]
+                        self.assertEqual(len(chats), 2)
+                        for entry in chats:
+                            self.assertEqual(entry["matched_message_ids"], [f"msg-{i * 11}" for i in range(expected)])
+                            self.assertEqual(entry["matched_message_ids"], [item["message_id"] for item in entry["matched_messages"]])
+                            self.assertTrue(all(type(item["score"]) is float for item in entry["matched_messages"]))
+                    for invalid in (True, False, "3", 3.0, 0, -1):
+                        response = await session.call_tool("search", {"query": "query", "message_top_k": invalid}, read_timeout_seconds=timedelta(seconds=10))
+                        self.assertTrue(response.isError, f"accepted invalid message_top_k: {invalid!r}")
+        asyncio.run(asyncio.wait_for(check_protocol(), timeout=45))
 
     def test_search_passes_ranked_message_anchors_without_changing_parent_rank(self) -> None:
-        parents = self.entries[:2]
+        parents = [*self.entries[:2], {**self.entries[0], "id": "eventMemId-no-messages"}, self.entries[2]]
         direct = [*parents]
-        scores = [0.99, 0.95]
+        scores = [0.99, 0.95, 0.9, 0.85]
         for parent, message_id, index, score, chunk in (
             (parents[0], "msg-20", 20, 0.80, 0),
             (parents[0], "msg-20", 20, 0.79, 1),
             (parents[0], "msg-10", 10, 0.80, 0),
             (parents[0], "msg-30", 30, 0.60, 0),
             (parents[0], "msg-40", 40, 0.59, 0),
+            (parents[0], "msg-61", 61, float("nan"), 0),
+            (parents[0], "msg-61", 61, 0.70, 1),
+            (parents[0], "msg-61", 61, 0.69, 2),
             (parents[1], "msg-50", 50, 0.30, 0),
-            (parents[1], "msg-60", 60, 0.10, 0),
+            (parents[1], "msg-61", 61, 0.10, 0),
         ):
             direct.append(utils.build_chat_dialogue_field_record_entry(
-                parent["id"], {"message_id": message_id, "message_index": index, "role": "user", "content": "text", "chunk_index": chunk, "chunk_count": 2},
+                parent["id"], {"message_id": message_id, "message_index": index, "role": "user", "content": "text", "chunk_index": chunk, "chunk_count": 3},
                 parent["created_at"], parent["updated_at"],
             ))
             scores.append(score)
@@ -281,21 +424,38 @@ class DialogueDetailIntegrationTests(unittest.TestCase):
                 return np.asarray([scores], dtype="float32"), np.asarray([list(range(len(direct)))])
 
         with ExitStack() as stack:
-            for target, name, value in ((server, "META_PATH", path), (server, "INDEX_PATH", index_path), (server, "SEARCH_MIN_SIMILARITY", None), (utils, "MESSAGE_SCORE_GAP", 0.2)):
+            for target, name, value in ((server, "META_PATH", path), (server, "INDEX_PATH", index_path), (server, "SEARCH_MIN_SIMILARITY", None), (utils, "MESSAGE_SCORE_GAP", 0.2), (utils, "MESSAGE_TOP_K", 3), (utils, "RETURN_MESSAGE_NUM", 10)):
                 stack.enter_context(patch.object(target, name, value))
             stack.enter_context(patch.object(server, "build_embedding_model_fingerprint", return_value="test"))
             stack.enter_context(patch.object(server, "encode_texts", return_value=np.ones((1, 2), dtype="float32")))
             stack.enter_context(patch.object(server.faiss, "read_index", return_value=FakeIndex()))
-            stack.enter_context(patch.object(server, "fetch_store_entries_by_ids", return_value=direct))
-            stack.enter_context(patch.object(server, "fetch_entry_family_by_source_ids", return_value=parents))
-            results = server.search_records("query", top_k=2, embedder=object(), model_path="test")
+            stack.enter_context(patch.object(server, "fetch_search_entries_by_ids", return_value=direct))
+            stack.enter_context(patch.object(server, "fetch_search_parents_by_ids", return_value=parents))
+            results = server.search_records("query", top_k=4, embedder=object(), model_path="test")
+            limited = server.search_records("query", top_k=4, message_top_k=1, embedder=object(), model_path="test")
+            top_two = server.search_records("query", top_k=2, embedder=object(), model_path="test")
         self.assertEqual([result["id"] for result in results], [entry["id"] for entry in parents])
         self.assertAlmostEqual(results[0]["score"], 0.99)
         self.assertEqual(results[0]["matched_fields"], ["raw_dialogue"])
-        self.assertEqual(results[0]["matched_message_ids"], ["msg-10", "msg-20", "msg-30"])
-        self.assertEqual(results[1]["matched_message_ids"], ["msg-50", "msg-60"])
+        self.assertEqual(results[0]["matched_message_ids"], ["msg-10", "msg-61", "msg-30"])
+        self.assertEqual(results[1]["matched_message_ids"], ["msg-50", "msg-61"])
+        self.assertEqual(results[2]["matched_message_ids"], [])
+        self.assertEqual(results[2]["matched_messages"], [])
+        self.assertNotIn("matched_messages", results[3])
+        self.assertNotIn("matched_message_ids", results[3])
+        self.assertEqual([item["id"] for item in top_two], [parent["id"] for parent in parents[:2]])
+        self.assertEqual(limited[0]["matched_message_ids"], ["msg-10"])
+        for expected, result in zip(scores[:4], results):
+            self.assertAlmostEqual(result["score"], expected)
+        for result, changed_limit in zip(results, limited):
+            self.assertEqual({key: value for key, value in result.items() if key not in ("matched_messages", "matched_message_ids")}, {key: value for key, value in changed_limit.items() if key not in ("matched_messages", "matched_message_ids")})
+        for result in results[:3]:
+            self.assertEqual(result["matched_message_ids"], [item["message_id"] for item in result["matched_messages"]])
+        self.assertAlmostEqual(results[0]["matched_messages"][0]["score"], 0.8)
+        self.assertAlmostEqual(results[0]["matched_messages"][1]["score"], 0.7)
+        self.assertAlmostEqual(results[0]["matched_messages"][2]["score"], 0.6)
         self.assertTrue(all("raw_dialogue" not in result for result in results))
-        detail = server.get_details_by_ids([item["id"] for item in results], {item["id"]: item["matched_message_ids"] for item in results})
+        detail = server.get_details_by_ids([item["id"] for item in results[:2]], {item["id"]: item["matched_message_ids"] for item in results[:2]})
         self.assertEqual(detail["records"][0]["raw_dialogue"]["context"]["anchor_message_ids"], results[0]["matched_message_ids"])
 
 
