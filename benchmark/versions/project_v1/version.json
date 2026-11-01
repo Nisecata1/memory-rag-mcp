@@ -1,0 +1,12 @@
+{
+  "schema_version": 1,
+  "id": "project_v1",
+  "label": "B1: memory-rag-mcp BGE-M3 / SQLite adapter v1",
+  "protocol": "memory-retrieval-v1",
+  "aliases": ["project"],
+  "result_key": "project",
+  "default": true,
+  "adapter": "adapter.py",
+  "config": "config.json",
+  "source_files": ["server.py", "server_utils.py", "embedding_utils.py", "memory_domain.py", "memory_store.py", "memory_access.py", "config/settings.yaml", "requirements.txt"]
+}

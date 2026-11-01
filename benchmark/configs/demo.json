@@ -1,0 +1,11 @@
+{
+  "schema_version": 1,
+  "dataset": "data/processed/locomo-demo-v1",
+  "versions": ["bm25_v1", "project_v1"],
+  "project_dir": "..",
+  "split": "dev",
+  "top_k": 5,
+  "window_radius": 10,
+  "message_top_k": 3,
+  "query_limit": 0
+}

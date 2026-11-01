@@ -1,0 +1,13 @@
+{
+  "schema_version": 1,
+  "id": "replace_me_v1",
+  "label": "Describe this experiment and its hypothesis",
+  "protocol": "memory-retrieval-v1",
+  "enabled": false,
+  "default": false,
+  "aliases": [],
+  "result_key": "replace_me_v1",
+  "adapter": "adapter.py",
+  "config": "config.json",
+  "source_files": []
+}

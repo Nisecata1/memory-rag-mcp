@@ -1,0 +1,12 @@
+{
+  "schema_version": 1,
+  "id": "bm25_v1",
+  "label": "B0: whole-message BM25 reference",
+  "protocol": "memory-retrieval-v1",
+  "aliases": ["bm25"],
+  "result_key": "bm25",
+  "default": true,
+  "adapter": "adapter.py",
+  "config": "config.json",
+  "source_files": []
+}
