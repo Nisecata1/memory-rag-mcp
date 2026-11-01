@@ -1,0 +1,8 @@
+# Keep byte-based dataset and evaluator fingerprints portable across checkouts.
+*.py text eol=lf
+*.json text eol=lf
+*.jsonl text eol=lf
+*.md text eol=lf
+*.ps1 text eol=lf
+.gitignore text eol=lf
+.gitattributes text eol=lf

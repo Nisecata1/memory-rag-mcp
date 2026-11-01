@@ -1,0 +1,8 @@
+__pycache__/
+*.pyc
+runs/
+# Keep the retired path ignored if an older checkout recreates it.
+memory-rag-mcp-data-test/
+data/raw/
+data/processed/
+.venv/
