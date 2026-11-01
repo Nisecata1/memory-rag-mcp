@@ -1,0 +1,101 @@
+{
+  "schema_version": 1,
+  "baseline_id": "locomo-demo-v1-baseline-20261029",
+  "scope": "Development demo only; derived text evidence retrieval, not official LoCoMo QA accuracy",
+  "run_id": "20261029T070259_918552Z",
+  "run_directory": "runs/20261029T070259_918552Z",
+  "dataset_fingerprint": "b7a92fe870e24f79c75696a4c2941884b72b2cb1aa1566379dc23cb6240ce634",
+  "query_set_fingerprint": "70155c292ac3885cb418d7ae525cbcc21bf909446c14064e17914e94ebb8a99e",
+  "metric_fingerprint": "9f9675ecc2faf843f930a14d9fea808af3838cf0e5ea3c0cc9fdfd1b1b2c7aa0",
+  "evaluation": {
+    "top_k": 5,
+    "window_radius": 10,
+    "message_top_k": 3,
+    "warmup_queries_per_scenario": 1,
+    "latency_percentile_method": "nearest-rank",
+    "evidence_metric": "coverage of published annotated evidence groups, not official QA accuracy"
+  },
+  "source": {
+    "project_dir": "C:\\Users\\ndir\\OneDrive\\Laplas_OneDrive\\_ide_ai_workspace\\AI-memory\\memory-rag-mcp",
+    "git_commit": "1a8f7ab9ec96053a7f3054e6255c2d1188de4471",
+    "files_sha256": {
+      "server.py": "3d2ff3c5a75fc576c2adee7d203ab764c3fd053ddef183b88b64109893bb7b01",
+      "server_utils.py": "b0898bd8747cce3d8a3ef2e895b097bc525e29b630e2175a21f516ca952d49a3",
+      "embedding_utils.py": "372568f0265418a74137e3b2bfa43f71db454d1bff210d3d79140eef00ac44f9",
+      "config/settings.yaml": "b291635a3732d76452ff07af4686514e2948f890f01d5451683b7b6790ea6555",
+      "requirements.txt": "865eade765111edfcb24a75e44ac8ed7defb93dd1b37258da1bbd1058e4014a6"
+    },
+    "fingerprint": "d292b40c0a6106e7f2a29ae39da65372a8c03871033bfd76e7b6d35b84d0147f",
+    "note": "The file hashes and saved snapshot identify the actual working tree, including uncommitted edits."
+  },
+  "summary": {
+    "bm25": {
+      "query_count": 24,
+      "answerable_count": 24,
+      "error_count": 0,
+      "error_rate": 0.0,
+      "hit_at_k": 0.9166666666666666,
+      "recall_at_k": 0.9166666666666666,
+      "mrr_at_k": 0.7638888888888888,
+      "evidence_coverage": 0.9166666666666666,
+      "evidence_complete": 0.9166666666666666,
+      "returned_characters_mean": 19742.541666666668,
+      "returned_messages_mean": 112.16666666666667,
+      "latency_p50_ms": 1.7073999624699354,
+      "latency_p95_ms": 2.3270000237971544,
+      "invalid_latency_count": 0,
+      "by_category": {
+        "single_hop": {
+          "query_count": 24,
+          "answerable_count": 24,
+          "error_count": 0,
+          "error_rate": 0.0,
+          "hit_at_k": 0.9166666666666666,
+          "recall_at_k": 0.9166666666666666,
+          "mrr_at_k": 0.7638888888888888,
+          "evidence_coverage": 0.9166666666666666,
+          "evidence_complete": 0.9166666666666666,
+          "returned_characters_mean": 19742.541666666668,
+          "returned_messages_mean": 112.16666666666667,
+          "latency_p50_ms": 1.7073999624699354,
+          "latency_p95_ms": 2.3270000237971544,
+          "invalid_latency_count": 0
+        }
+      }
+    },
+    "project": {
+      "query_count": 24,
+      "answerable_count": 24,
+      "error_count": 0,
+      "error_rate": 0.0,
+      "hit_at_k": 0.9583333333333334,
+      "recall_at_k": 0.9583333333333334,
+      "mrr_at_k": 0.7465277777777778,
+      "evidence_coverage": 0.9583333333333334,
+      "evidence_complete": 0.9583333333333334,
+      "returned_characters_mean": 19570.75,
+      "returned_messages_mean": 112.70833333333333,
+      "latency_p50_ms": 517.5808999920264,
+      "latency_p95_ms": 1292.8938999539241,
+      "invalid_latency_count": 0,
+      "by_category": {
+        "single_hop": {
+          "query_count": 24,
+          "answerable_count": 24,
+          "error_count": 0,
+          "error_rate": 0.0,
+          "hit_at_k": 0.9583333333333334,
+          "recall_at_k": 0.9583333333333334,
+          "mrr_at_k": 0.7465277777777778,
+          "evidence_coverage": 0.9583333333333334,
+          "evidence_complete": 0.9583333333333334,
+          "returned_characters_mean": 19570.75,
+          "returned_messages_mean": 112.70833333333333,
+          "latency_p50_ms": 517.5808999920264,
+          "latency_p95_ms": 1292.8938999539241,
+          "invalid_latency_count": 0
+        }
+      }
+    }
+  }
+}
